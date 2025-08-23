@@ -1,0 +1,18 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+.DS_Store
+
+# Virtual environments
+venv/
+.venv/
+
+# Local caches and large data
+shared_cache/
+results/
+
+# Test/venv artifacts
+finrobot_test/venv/
+
+# VS Code settings (optional)
+.vscode/
