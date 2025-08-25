@@ -29,6 +29,7 @@ class BullFlagSimpleV2Strategy:
         self._pullback_started: bool = False
         self._last_red_high: Optional[float] = None
         self._pullback_low: Optional[float] = None
+        self._pullback_volumes: list[float] = []
         # Count bars starting from the FIRST RED bar AFTER the ACTION alert
         self._bars_since_pullback_start: int = 0
         self._max_wait_candles: int = 6  # stop waiting after N bars from first red after alert
@@ -57,6 +58,12 @@ class BullFlagSimpleV2Strategy:
                             self._pullback_started = True
                             self._last_red_high = cur_high
                             self._pullback_low = float(df['low'].iloc[-1])
+                            # seed volumes list
+                            try:
+                                v = float(df['volume'].iloc[-1])
+                            except Exception:
+                                v = float('nan')
+                            self._pullback_volumes = [v]
                             # Initialize bar count window starting at first red after alert
                             self._bars_since_pullback_start = 1
                             try:
@@ -82,9 +89,54 @@ class BullFlagSimpleV2Strategy:
                                                          float(df['low'].iloc[-1]))
                             except Exception:
                                 self._pullback_low = float(df['low'].iloc[-1])
+                            try:
+                                v = float(df['volume'].iloc[-1])
+                            except Exception:
+                                v = float('nan')
+                            self._pullback_volumes.append(v)
                         elif is_green and self._last_red_high is not None:
                             # Trigger if green breaks last pullback candle's high
                             if cur_high >= float(self._last_red_high):
+                                # Entry quality gates (volume + retrace cap)
+                                try:
+                                    cur_vol = float(df['volume'].iloc[-1])
+                                except Exception:
+                                    cur_vol = float('nan')
+                                # Pullback average volume
+                                try:
+                                    vals = [float(x) for x in (self._pullback_volumes or []) if x == x]
+                                    pb_avg = (sum(vals) / len(vals)) if vals else float('nan')
+                                except Exception:
+                                    pb_avg = float('nan')
+                                # Volume multiple gate
+                                try:
+                                    mult = float(getattr(session, 'breakout_vol_mult', 0.0) or 0.0)
+                                except Exception:
+                                    mult = 0.0
+                                if mult > 0 and (pb_avg == pb_avg) and (cur_vol == cur_vol):
+                                    if cur_vol < pb_avg * mult:
+                                        # Reject entry due to insufficient breakout volume
+                                        return False
+                                # Minimum pullback average volume gate
+                                try:
+                                    min_pb = float(getattr(session, 'min_pullback_avg_volume', 0.0) or 0.0)
+                                except Exception:
+                                    min_pb = 0.0
+                                if min_pb > 0 and (pb_avg == pb_avg):
+                                    if pb_avg < min_pb:
+                                        return False
+                                # Retrace cap (<= 50% of pole height), using alert high/price as proxy for pole
+                                try:
+                                    ah = float(getattr(session.alert, 'alert_high', None) or float('nan'))
+                                    ap = float(getattr(session.alert, 'alert_price', None) or float('nan'))
+                                except Exception:
+                                    ah = float('nan'); ap = float('nan')
+                                pole_h = (ah - ap) if (ah == ah and ap == ap) else float('nan')
+                                if (self._pullback_low is not None) and (self._last_red_high is not None) and (pole_h == pole_h) and pole_h > 0:
+                                    pullback_depth = float(self._last_red_high) - float(self._pullback_low)
+                                    retrace_pct = pullback_depth / pole_h
+                                    if retrace_pct > 0.5:
+                                        return False
                                 # Cap entry to current bar's high for realistic fill
                                 raw_entry = float(self._last_red_high) + float(session.entry_slippage_cents or 0.0)
                                 entry_price = min(cur_high, raw_entry)
@@ -140,14 +192,27 @@ class BullFlagSimpleV2Strategy:
                         # doji/green without break: neither extend nor trigger
 
                         # Increment bar counter within the pullback window (no entry on this bar)
+                        # Robustly update bars-since using index math to avoid drift
                         try:
-                            self._bars_since_pullback_start += 1
+                            if self._pullback_start_index is not None:
+                                # Count bars strictly after first red up to current
+                                idx = df.index
+                                self._bars_since_pullback_start = int(((idx > self._pullback_start_index) & (idx <= idx[-1])).sum())
+                            else:
+                                self._bars_since_pullback_start = max(1, int(self._bars_since_pullback_start or 0) + 1)
                         except Exception:
                             self._bars_since_pullback_start = max(1, int(self._bars_since_pullback_start or 0) + 1)
 
                     # Stop waiting after N bars from first red after alert without entry
                     if self._pullback_started and (not self._entry_done):
-                        if self._bars_since_pullback_start >= self._max_wait_candles:
+                        # Recompute defensively in case counter missed a bar
+                        try:
+                            if self._pullback_start_index is not None:
+                                idx = df.index
+                                self._bars_since_pullback_start = int(((idx > self._pullback_start_index) & (idx <= idx[-1])).sum())
+                        except Exception:
+                            pass
+                        if int(self._bars_since_pullback_start) >= int(self._max_wait_candles):
                             try:
                                 logging.info(
                                     "BFSv2 timeout: %s | no breakout within %d bars from first red after alert (first_red=%s)",
