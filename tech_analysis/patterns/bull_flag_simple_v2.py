@@ -37,6 +37,9 @@ class BullFlagSimpleV2Strategy:
         # Target/stop tracking
         self._target_price: Optional[float] = None
         self._stop_price: Optional[float] = None
+        # Fallback/scale state
+        self._fallback_target: bool = False
+        self._first_target_done: bool = False
 
     def on_bar(self, session, df: pd.DataFrame, timestamp: datetime) -> bool:
         # Entry: after ACTION alert, wait for a contiguous red pullback, then
@@ -155,8 +158,22 @@ class BullFlagSimpleV2Strategy:
                                     target = float(getattr(session.alert, 'alert_high', None) or float('nan'))
                                 except Exception:
                                     target = float('nan')
-                                # Only set target if it is meaningfully above entry
-                                self._target_price = target if (target == target and target > entry_price + 1e-6) else None
+                                # Target selection: prefer alert_high if above entry; else fallback to 2R
+                                if (target == target) and (target > entry_price + 1e-6):
+                                    self._target_price = target
+                                    self._fallback_target = False
+                                else:
+                                    try:
+                                        rps = float(entry_price) - float(self._stop_price) if self._stop_price is not None else None
+                                        if rps is not None and rps > 0:
+                                            self._target_price = float(entry_price) + 2.0 * float(rps)
+                                            self._fallback_target = True
+                                        else:
+                                            self._target_price = None
+                                            self._fallback_target = False
+                                    except Exception:
+                                        self._target_price = None
+                                        self._fallback_target = False
                                 stop_loss = float(self._stop_price) if self._stop_price is not None else max(0.01, entry_price * 0.98)
                                 try:
                                     logging.info(
@@ -235,12 +252,41 @@ class BullFlagSimpleV2Strategy:
                     cur_open = float(cur['open'])
                     cur_high = float(cur['high'])
                     cur_low = float(cur['low'])
-                    # 1) Profit target hit: sell ALL at target
+                    # 1) Profit target hit
                     if self._target_price is not None and cur_high >= float(self._target_price):
                         price = float(self._target_price)
+                        # If target comes from fallback 2R and we haven't scaled yet, sell 1/2 and move stop to BE
+                        if self._fallback_target and (not self._first_target_done) and session.position is not None:
+                            try:
+                                shares_to_sell = max(1, int(session.position.current_shares * 0.5))
+                                session._partial_exit(timestamp, price, session.ExitReason.FIRST_TARGET, shares_to_sell)
+                                # Move stop to breakeven on remaining
+                                try:
+                                    if session.position and session.position.current_shares > 0:
+                                        new_stop = max(float(session.position.stop_loss), float(session.position.entry_price))
+                                        remaining = int(session.position.current_shares) - int(shares_to_sell)
+                                        if remaining < 0:
+                                            remaining = 0
+                                        session.position = session.position._replace(
+                                            current_shares=remaining,
+                                            stop_loss=new_stop,
+                                            status=session.TradeStatus.SCALED_FIRST if remaining > 0 else session.TradeStatus.EXITED
+                                        )
+                                        if remaining == 0:
+                                            session.status = session.MonitoringStatus.MONITORING_STOPPED
+                                except Exception:
+                                    pass
+                                self._first_target_done = True
+                                # Clear target to avoid repeated scales in v2 simple mode
+                                self._target_price = None
+                                return True
+                            except Exception:
+                                # Fallback to full exit if partial fails
+                                pass
+                        # Non-fallback target (alert_high) or already scaled: exit all
                         try:
                             logging.info(
-                                "BFSv2 exit: %s | bar=%s price=%.4f (target: alert_high)",
+                                "BFSv2 exit: %s | bar=%s price=%.4f (target hit)",
                                 getattr(session, 'symbol', '?'), str(df.index[-1]), price)
                         except Exception:
                             pass
