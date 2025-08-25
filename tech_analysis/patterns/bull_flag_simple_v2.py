@@ -122,26 +122,23 @@ class BullFlagSimpleV2Strategy:
         except Exception:
             pass
 
-        # Exit at first NON-alert bar after entry (or on RED alert bar) — flip behavior retained
+        # Exit on first RED candle after entry (regardless of alert status)
         try:
             if self._exit_pending and session.position is not None:
                 if self._entry_index is not None and len(df) >= 2 and df.index[-1] > self._entry_index:
                     try:
-                        if self._alert_times and (df.index[-1] in self._alert_times):
-                            try:
-                                cur_open = float(df['open'].iloc[-1])
-                                cur_close = float(df['close'].iloc[-1])
-                                is_red = cur_close < cur_open
-                            except Exception:
-                                is_red = False
-                            if not is_red:
-                                return False
+                        cur_open = float(df['open'].iloc[-1])
+                        cur_close = float(df['close'].iloc[-1])
+                        is_red = cur_close < cur_open
                     except Exception:
-                        pass
-                    exit_price = float(df['close'].iloc[-1])
-                    session._exit_position(timestamp, exit_price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
-                    self._exit_pending = False
-                    return True
+                        is_red = False
+                    if is_red:
+                        exit_price = float(df['close'].iloc[-1])
+                        session._exit_position(timestamp, exit_price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
+                        self._exit_pending = False
+                        return True
+                    else:
+                        return False
         except Exception:
             pass
 

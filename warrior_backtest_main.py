@@ -594,8 +594,8 @@ def run_backtest(
                         slice_end = datetime.strptime(f"{date} {end_time}", "%Y-%m-%d %H:%M")
                     except Exception:
                         slice_end = ohlc_data.index.max()
-                    # For alert_flip and bull_flag_simple_v2, slice through the first non-alert minute after alert
-                    if getattr(args, 'pattern', 'bull_flag') in ('alert_flip','bull_flag_simple_v2'):
+                    # For alert_flip only, slice through the first non-alert minute after alert
+                    if getattr(args, 'pattern', 'bull_flag') in ('alert_flip',):
                         from datetime import timedelta as _td
                         # Include all bars from alert_time up to the first non-alert minute (cap +30m).
                         # This allows exits on red alert bars if they occur, or on the first non-alert bar.
