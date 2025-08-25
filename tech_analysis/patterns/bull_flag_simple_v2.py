@@ -28,6 +28,7 @@ class BullFlagSimpleV2Strategy:
         # Pullback state
         self._pullback_started: bool = False
         self._last_red_high: Optional[float] = None
+        self._pullback_low: Optional[float] = None
         # Count bars starting from the FIRST RED bar AFTER the ACTION alert
         self._bars_since_pullback_start: int = 0
         self._max_wait_candles: int = 6  # stop waiting after N bars from first red after alert
@@ -37,95 +38,115 @@ class BullFlagSimpleV2Strategy:
         self._stop_price: Optional[float] = None
 
     def on_bar(self, session, df: pd.DataFrame, timestamp: datetime) -> bool:
-        # Entry: after ACTION alert, buy first bar whose HIGH >= prior bar's HIGH
-        # (prior bar may be green or red). Intrabar trigger at prior bar's high.
+        # Entry: after ACTION alert, wait for a contiguous red pullback, then
+        # enter intrabar when the first green breaks the last pullback candle's high.
         try:
             if (not self._entry_done) and (session.position is None) and (session.alert is not None):
                 at = session.alert.alert_time
-                if df.index[-1] > at and len(df) >= 2:
-                    prev_bar_ts = df.index[-2]
-                    # Ensure prior bar is not before alert (require a post-alert prior)
-                    if prev_bar_ts > at:
-                        prev_high = float(df['high'].iloc[-2])
-                        cur_open = float(df['open'].iloc[-1])
-                        cur_close = float(df['close'].iloc[-1])
-                        cur_high = float(df['high'].iloc[-1])
-                        # Trigger: current high breaks prior bar high
-                        if cur_high >= prev_high:
-                            entry_price = float(prev_high) + float(session.entry_slippage_cents or 0.0)
-                            # New stop/target rules:
-                            # - Stop loss: Low of the pivot candle (prior bar)
-                            # - Profit target: Action alert high; sell ALL at target
-                            pivot_low = float(df['low'].iloc[-2])
-                            self._stop_price = max(0.01, float(pivot_low))
+                if df.index[-1] > at:
+                    cur_open = float(df['open'].iloc[-1])
+                    cur_close = float(df['close'].iloc[-1])
+                    cur_high = float(df['high'].iloc[-1])
+                    cur_low = float(df['low'].iloc[-1])
+                    is_red = cur_close < cur_open
+                    is_green = cur_close > cur_open
+
+                    # Build/extend the contiguous red pullback
+                    if not self._pullback_started:
+                        if is_red:
+                            self._pullback_started = True
+                            self._last_red_high = cur_high
+                            self._pullback_low = float(df['low'].iloc[-1])
+                            # Initialize bar count window starting at first red after alert
+                            self._bars_since_pullback_start = 1
                             try:
-                                target = float(getattr(session.alert, 'alert_high', None) or float('nan'))
+                                self._pullback_start_index = df.index[-1]
                             except Exception:
-                                target = float('nan')
-                            self._target_price = target if target == target else None  # nan-safe
-                            try:
-                                from risk_config import PREFERRED_STOP_DISTANCE_PCT
-                                _ = float(PREFERRED_STOP_DISTANCE_PCT)  # no-op, kept for compatibility
-                            except Exception:
-                                pass
-                            stop_loss = float(self._stop_price)
+                                self._pullback_start_index = None
                             try:
                                 logging.info(
-                                    "BFSv2 entry: %s | price=%.4f stop=%.4f trigger_bar=%s prev_high=%.4f",
+                                    "BFSv2 pullback-start: %s | first_red=%s last_red_high=%.4f",
                                     getattr(session, 'symbol', '?'),
-                                    float(entry_price),
-                                    float(stop_loss),
-                                    str(df.index[-1]),
-                                    float(prev_high)
+                                    str(self._pullback_start_index) if self._pullback_start_index is not None else 'n/a',
+                                    float(self._last_red_high) if self._last_red_high is not None else float('nan')
                                 )
                             except Exception:
                                 pass
-                            session._enter_direct(entry_price, stop_loss, timestamp, reason="BullFlag_Simple_V2_Entry")
-                            self._entry_done = True
-                            self._exit_pending = True
-                            self._entry_index = df.index[-1]
-                            # Immediate exit if entry bar closes red (kept unless instructed otherwise)
+                        # else still waiting for first red
+                    else:
+                        if is_red:
+                            # Extend pullback; update last red high
+                            self._last_red_high = cur_high
                             try:
-                                if cur_close < cur_open and session.position is not None:
-                                    exit_price = float(cur_close)
-                                    logging.info(
-                                        "BFSv2 exit: %s | bar=%s price=%.4f (entry bar closed red)",
-                                        getattr(session, 'symbol', '?'),
-                                        str(df.index[-1]),
-                                        float(exit_price)
-                                    )
-                                    session._exit_position(timestamp, exit_price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
-                                    self._exit_pending = False
+                                self._pullback_low = min(float(self._pullback_low) if self._pullback_low is not None else cur_low,
+                                                         float(df['low'].iloc[-1]))
                             except Exception:
-                                pass
-                            return True
+                                self._pullback_low = float(df['low'].iloc[-1])
+                        elif is_green and self._last_red_high is not None:
+                            # Trigger if green breaks last pullback candle's high
+                            if cur_high >= float(self._last_red_high):
+                                # Cap entry to current bar's high for realistic fill
+                                raw_entry = float(self._last_red_high) + float(session.entry_slippage_cents or 0.0)
+                                entry_price = min(cur_high, raw_entry)
+                                # New stop/target rules
+                                # Use true pullback pivot low if available; fallback to prior bar low
+                                pivot_low = None
+                                try:
+                                    if self._pullback_low is not None:
+                                        pivot_low = float(self._pullback_low)
+                                    elif len(df) >= 2:
+                                        pivot_low = float(df['low'].iloc[-2])
+                                except Exception:
+                                    pivot_low = None
+                                self._stop_price = max(0.01, float(pivot_low)) if pivot_low is not None else None
+                                try:
+                                    target = float(getattr(session.alert, 'alert_high', None) or float('nan'))
+                                except Exception:
+                                    target = float('nan')
+                                # Only set target if it is meaningfully above entry
+                                self._target_price = target if (target == target and target > entry_price + 1e-6) else None
+                                stop_loss = float(self._stop_price) if self._stop_price is not None else max(0.01, entry_price * 0.98)
+                                try:
+                                    logging.info(
+                                        "BFSv2 entry: %s | price=%.4f stop=%.4f trigger_bar=%s last_pullback_high=%.4f",
+                                        getattr(session, 'symbol', '?'),
+                                        float(entry_price),
+                                        float(stop_loss),
+                                        str(df.index[-1]),
+                                        float(self._last_red_high)
+                                    )
+                                except Exception:
+                                    pass
+                                session._enter_direct(entry_price, stop_loss, timestamp, reason="BullFlag_Simple_V2_Entry")
+                                self._entry_done = True
+                                self._exit_pending = True
+                                self._entry_index = df.index[-1]
+                                # Immediate exit if entry bar closes red
+                                try:
+                                    if cur_close < cur_open and session.position is not None:
+                                        exit_price = float(cur_close)
+                                        logging.info(
+                                            "BFSv2 exit: %s | bar=%s price=%.4f (entry bar closed red)",
+                                            getattr(session, 'symbol', '?'),
+                                            str(df.index[-1]),
+                                            float(exit_price)
+                                        )
+                                        # Use a more descriptive reason for analytics
+                                        session._exit_position(timestamp, exit_price, session.ExitReason.NO_IMMEDIATE_BREAKOUT, session.position.current_shares)
+                                        self._exit_pending = False
+                                except Exception:
+                                    pass
+                                return True
+                        # doji/green without break: neither extend nor trigger
 
-                # Maintain pullback anchor and timeout accounting (from first red after alert)
-                if df.index[-1] > at:
-                    try:
-                        cur_open = float(df['open'].iloc[-1])
-                        cur_close = float(df['close'].iloc[-1])
-                        is_red = cur_close < cur_open
-                    except Exception:
-                        is_red = False
-                    if not self._pullback_started and is_red:
-                        self._pullback_started = True
-                        self._bars_since_pullback_start = 1
+                        # Increment bar counter within the pullback window (no entry on this bar)
                         try:
-                            self._pullback_start_index = df.index[-1]
+                            self._bars_since_pullback_start += 1
                         except Exception:
-                            self._pullback_start_index = None
-                        try:
-                            logging.info(
-                                "BFSv2 pullback-start: %s | first_red=%s last_red_high=%.4f",
-                                getattr(session, 'symbol', '?'),
-                                str(self._pullback_start_index) if self._pullback_start_index is not None else 'n/a',
-                                float('nan')
-                            )
-                        except Exception:
-                            pass
-                    elif self._pullback_started and not self._entry_done:
-                        self._bars_since_pullback_start += 1
+                            self._bars_since_pullback_start = max(1, int(self._bars_since_pullback_start or 0) + 1)
+
+                    # Stop waiting after N bars from first red after alert without entry
+                    if self._pullback_started and (not self._entry_done):
                         if self._bars_since_pullback_start >= self._max_wait_candles:
                             try:
                                 logging.info(
@@ -158,7 +179,7 @@ class BullFlagSimpleV2Strategy:
                                 getattr(session, 'symbol', '?'), str(df.index[-1]), price)
                         except Exception:
                             pass
-                        session._exit_position(timestamp, price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
+                        session._exit_position(timestamp, price, session.ExitReason.FIRST_TARGET, session.position.current_shares)
                         self._exit_pending = False
                         return True
                     # 2) Stop loss hit: simulate intrabar stop fill (open gap or low breach)
@@ -182,7 +203,7 @@ class BullFlagSimpleV2Strategy:
                                     getattr(session, 'symbol', '?'), str(df.index[-1]), price)
                             except Exception:
                                 pass
-                            session._exit_position(timestamp, price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
+                            session._exit_position(timestamp, price, session.ExitReason.STOP_LOSS, session.position.current_shares)
                             self._exit_pending = False
                             return True
         except Exception:

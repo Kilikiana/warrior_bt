@@ -352,17 +352,22 @@ class PatternMonitoringSession:
             pass
 
         if strategy_active:
-            # Run strategy handler regardless of status (ACTIVE or POSITION_ENTERED)
-            self._check_patterns(df, timestamp) if (self.status == MonitoringStatus.ACTIVE and entries_allowed) else None
-            # Also allow strategy to manage exits while in a position
-            # Call again to ensure exit logic runs even if entries are disallowed or status != ACTIVE
+            # Handle simple strategies explicitly, once per bar.
+            # - Allow entries only when entries_allowed is True and we have no position
+            # - Always allow exit management when a position exists
             try:
+                # Entry/exit for alert_flip
                 if self._alert_flip is not None:
-                    self._alert_flip.on_bar(self, df, timestamp)
+                    if (self.position is None and entries_allowed) or (self.position is not None):
+                        self._alert_flip.on_bar(self, df, timestamp)
+                # Entry/exit for bull_flag_simple
                 if getattr(self, '_bull_flag_simple', None) is not None:
-                    self._bull_flag_simple.on_bar(self, df, timestamp)
+                    if (self.position is None and entries_allowed) or (self.position is not None):
+                        self._bull_flag_simple.on_bar(self, df, timestamp)
+                # Entry/exit for bull_flag_simple_v2
                 if getattr(self, '_bull_flag_simple_v2', None) is not None:
-                    self._bull_flag_simple_v2.on_bar(self, df, timestamp)
+                    if (self.position is None and entries_allowed) or (self.position is not None):
+                        self._bull_flag_simple_v2.on_bar(self, df, timestamp)
             except Exception:
                 pass
             # Do not invoke default _manage_position when a simple strategy is active

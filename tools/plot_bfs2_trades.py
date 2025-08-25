@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
+# Use a headless backend to avoid GUI popups/crashes on macOS/headless
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from core.config import RESULTS_DIR
@@ -77,16 +80,31 @@ def _last_red_high_between(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timest
 
 
 def _plot_candles(ax, df: pd.DataFrame):
-    # Simple manual candlesticks
-    width = 0.5
+    """Draw simple candlesticks using numeric datetime coordinates.
+
+    Uses matplotlib date numbers to avoid backend-specific datetime handling issues
+    (e.g., Rectangle width with pandas Timedelta).
+    """
     up_color = '#26a69a'
     dn_color = '#ef5350'
-    for t, row in df.iterrows():
+    # Convert timestamps to numeric date values
+    x_nums = mdates.date2num(df.index.to_pydatetime())
+    # 1-minute width in date units (days)
+    if len(x_nums) >= 2:
+        bar_width = (x_nums[1] - x_nums[0]) * 0.8  # 80% body width
+        half_width = bar_width / 2.0
+    else:
+        bar_width = (1.0 / 1440.0) * 0.8
+        half_width = bar_width / 2.0
+    for i, (_, row) in enumerate(df.iterrows()):
+        x = x_nums[i]
         o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
         color = up_color if c >= o else dn_color
-        ax.vlines(t, l, h, color=color, linewidth=1)
+        # Wick
+        ax.vlines(x, l, h, color=color, linewidth=1)
+        # Body
         top, bottom = (c, o) if c >= o else (o, c)
-        ax.add_patch(plt.Rectangle((t - pd.Timedelta(minutes=0.5), bottom), pd.Timedelta(minutes=1), top - bottom, 
+        ax.add_patch(plt.Rectangle((x - half_width, bottom), bar_width, top - bottom,
                                    edgecolor=color, facecolor=color, linewidth=0.8))
 
 
