@@ -32,6 +32,9 @@ class BullFlagSimpleV2Strategy:
         self._bars_since_pullback_start: int = 0
         self._max_wait_candles: int = 6  # stop waiting after N bars from first red after alert
         self._pullback_start_index: Optional[pd.Timestamp] = None
+        # Target/stop tracking
+        self._target_price: Optional[float] = None
+        self._stop_price: Optional[float] = None
 
     def on_bar(self, session, df: pd.DataFrame, timestamp: datetime) -> bool:
         # Entry: after ACTION alert, buy first bar whose HIGH >= prior bar's HIGH
@@ -50,12 +53,22 @@ class BullFlagSimpleV2Strategy:
                         # Trigger: current high breaks prior bar high
                         if cur_high >= prev_high:
                             entry_price = float(prev_high) + float(session.entry_slippage_cents or 0.0)
+                            # New stop/target rules:
+                            # - Stop loss: Low of the pivot candle (prior bar)
+                            # - Profit target: Action alert high; sell ALL at target
+                            pivot_low = float(df['low'].iloc[-2])
+                            self._stop_price = max(0.01, float(pivot_low))
+                            try:
+                                target = float(getattr(session.alert, 'alert_high', None) or float('nan'))
+                            except Exception:
+                                target = float('nan')
+                            self._target_price = target if target == target else None  # nan-safe
                             try:
                                 from risk_config import PREFERRED_STOP_DISTANCE_PCT
-                                stop_pct = float(PREFERRED_STOP_DISTANCE_PCT)
+                                _ = float(PREFERRED_STOP_DISTANCE_PCT)  # no-op, kept for compatibility
                             except Exception:
-                                stop_pct = 0.02
-                            stop_loss = max(0.01, entry_price * (1.0 - stop_pct))
+                                pass
+                            stop_loss = float(self._stop_price)
                             try:
                                 logging.info(
                                     "BFSv2 entry: %s | price=%.4f stop=%.4f trigger_bar=%s prev_high=%.4f",
@@ -71,7 +84,7 @@ class BullFlagSimpleV2Strategy:
                             self._entry_done = True
                             self._exit_pending = True
                             self._entry_index = df.index[-1]
-                            # Immediate exit if entry bar closes red
+                            # Immediate exit if entry bar closes red (kept unless instructed otherwise)
                             try:
                                 if cur_close < cur_open and session.position is not None:
                                     exit_price = float(cur_close)
@@ -128,53 +141,50 @@ class BullFlagSimpleV2Strategy:
         except Exception:
             pass
 
-        # Exit on first RED candle after entry (regardless of alert status)
+        # Exit/management after entry: stop at pivot low; sell ALL at action alert high
         try:
             if self._exit_pending and session.position is not None:
                 if self._entry_index is not None and len(df) >= 2 and df.index[-1] > self._entry_index:
-                    try:
-                        cur_open = float(df['open'].iloc[-1])
-                        cur_close = float(df['close'].iloc[-1])
-                        is_red = cur_close < cur_open
-                    except Exception:
-                        is_red = False
-                    # Trace exit check for debugging
-                    try:
-                        logging.info(
-                            "BFSv2 exit-check: %s | bar=%s open=%.4f close=%.4f is_red=%s entry_idx=%s",
-                            getattr(session, 'symbol', '?'),
-                            str(df.index[-1]),
-                            float(df['open'].iloc[-1]) if 'open' in df.columns else float('nan'),
-                            float(df['close'].iloc[-1]) if 'close' in df.columns else float('nan'),
-                            str(is_red),
-                            str(self._entry_index)
-                        )
-                    except Exception:
-                        pass
-                    if is_red:
-                        exit_price = float(df['close'].iloc[-1])
+                    cur = df.iloc[-1]
+                    cur_open = float(cur['open'])
+                    cur_high = float(cur['high'])
+                    cur_low = float(cur['low'])
+                    # 1) Profit target hit: sell ALL at target
+                    if self._target_price is not None and cur_high >= float(self._target_price):
+                        price = float(self._target_price)
                         try:
                             logging.info(
-                                "BFSv2 exit: %s | bar=%s price=%.4f (first red after entry)",
-                                getattr(session, 'symbol', '?'),
-                                str(df.index[-1]),
-                                float(exit_price)
-                            )
+                                "BFSv2 exit: %s | bar=%s price=%.4f (target: alert_high)",
+                                getattr(session, 'symbol', '?'), str(df.index[-1]), price)
                         except Exception:
                             pass
-                        try:
-                            session._exit_position(timestamp, exit_price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
-                            self._exit_pending = False
-                            return True
-                        except Exception as e:
+                        session._exit_position(timestamp, price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
+                        self._exit_pending = False
+                        return True
+                    # 2) Stop loss hit: simulate intrabar stop fill (open gap or low breach)
+                    stop = float(self._stop_price) if self._stop_price is not None else float(getattr(session.position, 'stop_loss', 0.0) or 0.0)
+                    if stop > 0.0:
+                        stop_hit = False
+                        stop_fill = None
+                        if cur_open <= stop:
+                            stop_hit = True
+                            base = cur_open
+                            stop_fill = max(cur_low, base - float(getattr(session, 'stop_slippage_cents', 0.0) or 0.0))
+                        elif cur_low <= stop:
+                            stop_hit = True
+                            base = stop
+                            stop_fill = max(cur_low, base - float(getattr(session, 'stop_slippage_cents', 0.0) or 0.0))
+                        if stop_hit:
+                            price = float(stop_fill)
                             try:
-                                logging.warning("BFSv2 exit error for %s at %s: %s", getattr(session, 'symbol', '?'), str(df.index[-1]), e)
+                                logging.info(
+                                    "BFSv2 exit: %s | bar=%s price=%.4f (stop: pivot low)",
+                                    getattr(session, 'symbol', '?'), str(df.index[-1]), price)
                             except Exception:
                                 pass
-                            # Do not swallow; keep exit pending for next bar
-                            return False
-                    else:
-                        return False
+                            session._exit_position(timestamp, price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
+                            self._exit_pending = False
+                            return True
         except Exception:
             pass
 
