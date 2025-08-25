@@ -271,6 +271,11 @@ class PatternMonitoringSession:
             self.min_pullback_avg_volume = float(getattr(cfg, 'min_pullback_avg_volume', 0.0) or 0.0)
         except Exception:
             self.min_pullback_avg_volume = 0.0
+        # Simple v2 behavior toggles
+        try:
+            self.v2_partial_on_alert_high = bool(getattr(cfg, 'v2_partial_on_alert_high', True))
+        except Exception:
+            self.v2_partial_on_alert_high = True
         self.position_sizer = position_sizer
         self.sizing_method = cfg.sizing_method
         self.use_5min_first_red_exit = cfg.use_5min_first_red_exit

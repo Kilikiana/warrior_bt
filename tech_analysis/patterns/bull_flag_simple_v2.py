@@ -283,7 +283,35 @@ class BullFlagSimpleV2Strategy:
                             except Exception:
                                 # Fallback to full exit if partial fails
                                 pass
-                        # Non-fallback target (alert_high) or already scaled: exit all
+                        # Non-fallback target (alert_high) or already scaled
+                        # Optionally do partial on alert_high targets too (config), then move stop to BE
+                        if (not self._fallback_target) and (not self._first_target_done) and getattr(session, 'v2_partial_on_alert_high', False) and session.position is not None:
+                            try:
+                                shares_to_sell = max(1, int(session.position.current_shares * 0.5))
+                                session._partial_exit(timestamp, price, session.ExitReason.FIRST_TARGET, shares_to_sell)
+                                # Move stop to breakeven on remaining
+                                try:
+                                    if session.position and session.position.current_shares > 0:
+                                        new_stop = max(float(session.position.stop_loss), float(session.position.entry_price))
+                                        remaining = int(session.position.current_shares) - int(shares_to_sell)
+                                        if remaining < 0:
+                                            remaining = 0
+                                        session.position = session.position._replace(
+                                            current_shares=remaining,
+                                            stop_loss=new_stop,
+                                            status=session.TradeStatus.SCALED_FIRST if remaining > 0 else session.TradeStatus.EXITED
+                                        )
+                                        if remaining == 0:
+                                            session.status = session.MonitoringStatus.MONITORING_STOPPED
+                                except Exception:
+                                    pass
+                                self._first_target_done = True
+                                # Clear target to avoid repeated scales in v2 simple mode
+                                self._target_price = None
+                                return True
+                            except Exception:
+                                pass
+                        # Otherwise exit all
                         try:
                             logging.info(
                                 "BFSv2 exit: %s | bar=%s price=%.4f (target hit)",
