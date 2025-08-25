@@ -94,6 +94,9 @@ class ExitReason(Enum):
     PATTERN_FAILURE = "pattern_failure"
     SESSION_END = "session_end"
     NEXT_BAR_CLOSE = "next_bar_close"  # For alert-close-flip strategy
+    # BFSv2 runner reasons
+    RUNNER_MACD_GATE = "runner_macd_gate"
+    RUNNER_HARDCAP = "runner_hardcap"
 
 class ActionAlert(NamedTuple):
     """Action alert details"""
@@ -171,6 +174,33 @@ class SessionConfig:
     require_macd_positive: bool = False  # require macd>0 and histogram>0 at entry bar
     # Alert times (for alert_flip strategy to avoid selling on alert bars)
     all_alert_times: Optional[list] = None
+    # --- BFSv2-specific toggles ---
+    # Partial behavior on alert_high targets (also applies to fallback 2R internally)
+    v2_partial_on_alert_high: bool = True
+    # Runner controls
+    v2_runner_enabled: bool = True
+    v2_runner_macd_gate_minutes: int = 10  # T+10 min MACD gate
+    v2_runner_hard_cap_R: float = 3.0      # Hard cap on runner at 3R
+    # Use session.runner_stop_mode for trailing; BE floor enforced in strategy
+    # Entry confirmations (BFSv2 entry-only gates)
+    v2_entry_confirm_ema: bool = False     # require EMA9>EMA20 at entry
+    v2_entry_confirm_macd: bool = False    # require MACD bullish (macd>signal and hist>0)
+    # Entry realism toggles
+    v2_enter_on_close_with_gate: bool = False  # when breakout_vol_mult>0, enter on close to avoid same-bar volume look-ahead
+    # Guardrails
+    v2_min_stop_dollars: float = 0.10      # minimum stop distance used for sizing/targets
+    # Entry confirmations (single selector for BFSv2): 'both' | 'macd_only' | 'ema_only' | 'none'
+    v2_entry_confirmations: str = "none"
+    # BFSv2 MACD gate controls
+    v2_macd_gate_require_runner: bool = True
+    v2_macd_gate_require_no_progress: bool = False
+    v2_no_progress_thresh_r: float = 0.0
+    # BFSv2 structure knobs
+    v2_max_wait_bars: int = 6
+    v2_retrace_cap_pct: float = 0.50
+    # Optional entry guards
+    v2_require_vwap_above: bool = False
+    v2_entry_confirm_ema5m: bool = False
 
 class PatternMonitoringSession:
     """
@@ -276,6 +306,44 @@ class PatternMonitoringSession:
             self.v2_partial_on_alert_high = bool(getattr(cfg, 'v2_partial_on_alert_high', True))
         except Exception:
             self.v2_partial_on_alert_high = True
+        # BFSv2 runner + entry toggles
+        self.v2_runner_enabled = bool(getattr(cfg, 'v2_runner_enabled', True))
+        try:
+            self.v2_runner_macd_gate_minutes = int(getattr(cfg, 'v2_runner_macd_gate_minutes', 10) or 10)
+        except Exception:
+            self.v2_runner_macd_gate_minutes = 10
+        try:
+            self.v2_runner_hard_cap_R = float(getattr(cfg, 'v2_runner_hard_cap_R', 3.0) or 3.0)
+        except Exception:
+            self.v2_runner_hard_cap_R = 3.0
+        self.v2_entry_confirm_ema = bool(getattr(cfg, 'v2_entry_confirm_ema', False))
+        self.v2_entry_confirm_macd = bool(getattr(cfg, 'v2_entry_confirm_macd', False))
+        self.v2_enter_on_close_with_gate = bool(getattr(cfg, 'v2_enter_on_close_with_gate', False))
+        try:
+            self.v2_min_stop_dollars = float(getattr(cfg, 'v2_min_stop_dollars', 0.10) or 0.10)
+        except Exception:
+            self.v2_min_stop_dollars = 0.10
+        # Unified confirmations selector (optional override of booleans)
+        self.v2_entry_confirmations = getattr(cfg, 'v2_entry_confirmations', 'none')
+        if self.v2_entry_confirmations not in ("both","macd_only","ema_only","none"):
+            self.v2_entry_confirmations = "none"
+        # MACD gate + structure knobs
+        self.v2_macd_gate_require_runner = bool(getattr(cfg, 'v2_macd_gate_require_runner', True))
+        self.v2_macd_gate_require_no_progress = bool(getattr(cfg, 'v2_macd_gate_require_no_progress', False))
+        try:
+            self.v2_no_progress_thresh_r = float(getattr(cfg, 'v2_no_progress_thresh_r', 0.0) or 0.0)
+        except Exception:
+            self.v2_no_progress_thresh_r = 0.0
+        try:
+            self.v2_max_wait_bars = int(getattr(cfg, 'v2_max_wait_bars', 6) or 6)
+        except Exception:
+            self.v2_max_wait_bars = 6
+        try:
+            self.v2_retrace_cap_pct = float(getattr(cfg, 'v2_retrace_cap_pct', 0.50) or 0.50)
+        except Exception:
+            self.v2_retrace_cap_pct = 0.50
+        self.v2_require_vwap_above = bool(getattr(cfg, 'v2_require_vwap_above', False))
+        self.v2_entry_confirm_ema5m = bool(getattr(cfg, 'v2_entry_confirm_ema5m', False))
         self.position_sizer = position_sizer
         self.sizing_method = cfg.sizing_method
         self.use_5min_first_red_exit = cfg.use_5min_first_red_exit
@@ -1464,11 +1532,26 @@ class PatternMonitoringSession:
 
         # Calculate R-multiple for the partial if it's first target
         if reason == ExitReason.FIRST_TARGET and self.position:
-            risk_per_share = self.position.entry_price - self.position.stop_loss  # Original stop before BE move
-            r_on_partial = (price - self.position.entry_price) / max(risk_per_share, 1e-6)
+            # Use initial (snapshot) risk per share to avoid using a mutated stop (now at BE)
+            try:
+                snap = getattr(self, "_entry_snapshot", None) or {}
+                init_rps = snap.get("initial_risk_per_share")
+                if init_rps is None or init_rps <= 0:
+                    init_entry = snap.get("entry_price")
+                    init_stop = snap.get("initial_stop")
+                    if init_entry is not None and init_stop is not None:
+                        init_rps = float(init_entry) - float(init_stop)
+                r_on_partial = None
+                if init_rps is not None and init_rps > 0:
+                    r_on_partial = (float(price) - float(self.position.entry_price)) / float(init_rps)
+            except Exception:
+                r_on_partial = None
             logging.info(f"SCALED OUT {self.symbol}: {shares} shares at ${price:.2f} - {reason.value}")
-            logging.info(f"{self.symbol}: moved stop to BE ${self.position.entry_price:.2f} "
-                        f"after {r_on_partial:.1f}R partial")
+            if r_on_partial is not None:
+                logging.info(f"{self.symbol}: moved stop to BE ${self.position.entry_price:.2f} "
+                            f"after {r_on_partial:.1f}R partial")
+            else:
+                logging.info(f"{self.symbol}: moved stop to BE ${self.position.entry_price:.2f} after partial")
         else:
             logging.info(f"SCALED OUT {self.symbol}: {shares} shares at ${price:.2f} - {reason.value}")
     

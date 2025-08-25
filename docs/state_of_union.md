@@ -81,8 +81,6 @@ Note: The large improvement with partials is date‑sensitive. The setting is a 
 
 ## Known Gaps / Open Questions
 
-- No post‑entry “breakout or bailout” timer (e.g., exit flat if no progress in 10 minutes).
-- No “first red after entry” exit (code comment implied it; behavior wasn’t implemented in v2).
 - No explicit “no‑new‑high during pullback” or trendline breakout gate (kept for later; full detector has richer structure checks).
 - `SESSION_END` still occurs if a position remains open at day end; optional `--no-force-flatten` could be added for purist backtests.
 
@@ -94,18 +92,21 @@ Note: The large improvement with partials is date‑sensitive. The setting is a 
 - Optional: EMA/VWAP overlays in plots (already supported in manager logic) and richer chart annotations.
 - Later (if desired): add “no new high in pullback” and trendline breakout gate inspired by research repo.
 
-### Planned Enhancement (v2 Runner Logic)
+### New: v2 Runner Logic (Implemented)
 
-- 10‑minute MACD gate (post‑entry):
-  - At 10 minutes after entry, check 1‑minute MACD.
-  - If bearish (macd < signal or histogram ≤ 0): exit remaining shares.
-  - If bullish: continue to hold the runner.
-- Runner management while holding:
-  - Trail stop at EMA9 (1‑minute), but never below breakeven.
-  - Hard cap target at 3R (entry + 3 × risk per share); exit remaining at that level if hit.
-  - Keep existing 2R partial (50%) and move‑to‑breakeven behavior.
-- Visual overlays:
-  - Add EMA9/EMA20/VWAP to BFSv2 plots to verify trend strength and show where the 10‑minute MACD check occurred.
+- 10‑minute MACD gate: at T+10 min from entry, if MACD turns bearish (macd < signal or histogram ≤ 0), exit remaining shares; otherwise continue.
+- Runner while holding: trail stop at EMA9 (1‑minute) with breakeven floor; never lower the stop.
+- Hard cap: exit remainder at 3R (configurable) if reached.
+- Keeps existing 2R partial (50%) with move‑to‑breakeven; optional 50% on alert_high (`v2_partial_on_alert_high`).
+
+Config knobs (BFSv2):
+- `--v2-runner-enabled | --no-v2-runner-enabled`
+- `--v2-runner-macd-gate-minutes` (default 10)
+- `--v2-runner-hard-cap-r` (default 3.0)
+- `--v2-partial-on-alert-high | --no-v2-partial-on-alert-high`
+- `--v2-entry-confirm-ema`, `--v2-entry-confirm-macd`
+- `--v2-enter-on-close-with-gate` (avoid same‑bar volume look‑ahead when `--breakout-vol-mult` > 0)
+- `--v2-min-stop-dollars` (default $0.10)
 
 ## File/Commit Pointers
 

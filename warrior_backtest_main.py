@@ -519,6 +519,24 @@ def run_backtest(
             spread_cap_bps=float(getattr(args, 'spread_cap_bps', 0.0) or 0.0),
             require_macd_positive=bool(getattr(args, 'require_macd_positive', False)),
             all_alert_times=all_alert_times,
+            # BFSv2 toggles
+            v2_partial_on_alert_high=bool(getattr(args, 'v2_partial_on_alert_high', True)),
+            v2_runner_enabled=bool(getattr(args, 'v2_runner_enabled', True)),
+            v2_runner_macd_gate_minutes=int(getattr(args, 'v2_runner_macd_gate_minutes', 10) or 10),
+            v2_runner_hard_cap_R=float(getattr(args, 'v2_runner_hard_cap_r', 3.0) or 3.0),
+            v2_entry_confirm_ema=bool(getattr(args, 'v2_entry_confirm_ema', False)),
+            v2_entry_confirm_macd=bool(getattr(args, 'v2_entry_confirm_macd', False)),
+            v2_entry_confirmations=str(getattr(args, 'v2_entry_confirmations', 'none')),
+            v2_enter_on_close_with_gate=bool(getattr(args, 'v2_enter_on_close_with_gate', False)),
+            v2_min_stop_dollars=float(getattr(args, 'v2_min_stop_dollars', 0.10) or 0.10),
+            # MACD gate + structure knobs
+            v2_macd_gate_require_runner=bool(getattr(args, 'v2_macd_gate_require_runner', True)),
+            v2_macd_gate_require_no_progress=bool(getattr(args, 'v2_macd_gate_require_no_progress', False)),
+            v2_no_progress_thresh_r=float(getattr(args, 'v2_no_progress_thresh_r', 0.0) or 0.0),
+            v2_max_wait_bars=int(getattr(args, 'v2_max_wait_bars', 6) or 6),
+            v2_retrace_cap_pct=float(getattr(args, 'v2_retrace_cap_pct', 0.50) or 0.50),
+            v2_require_vwap_above=bool(getattr(args, 'v2_require_vwap_above', False)),
+            v2_entry_confirm_ema5m=bool(getattr(args, 'v2_entry_confirm_ema5m', False)),
         )
         monitor = PatternMonitoringSession(
             alert=action_alert,
@@ -817,6 +835,30 @@ if __name__ == "__main__":
     parser.add_argument('--manage-past-end', dest='manage_past_end', action='store_true', help='Continue managing open positions after end-time')
     parser.add_argument('--no-manage-past-end', dest='manage_past_end', action='store_false', help='Clamp bars at end-time; do not manage past end')
     parser.set_defaults(manage_past_end=True)
+    # BFSv2 toggles
+    parser.add_argument('--v2-partial-on-alert-high', dest='v2_partial_on_alert_high', action='store_true', help='On alert_high target, sell 50% and move stop to BE (default ON)')
+    parser.add_argument('--no-v2-partial-on-alert-high', dest='v2_partial_on_alert_high', action='store_false', help='Disable partial at alert_high (sell all)')
+    parser.set_defaults(v2_partial_on_alert_high=True)
+    parser.add_argument('--v2-runner-enabled', dest='v2_runner_enabled', action='store_true', help='Enable BFSv2 runner management after first scale (default ON)')
+    parser.add_argument('--no-v2-runner-enabled', dest='v2_runner_enabled', action='store_false', help='Disable BFSv2 runner management')
+    parser.set_defaults(v2_runner_enabled=True)
+    parser.add_argument('--v2-runner-macd-gate-minutes', type=int, default=10, help='Minutes after entry to apply MACD gate on runner')
+    parser.add_argument('--v2-runner-hard-cap-r', type=float, default=3.0, help='Hard cap target for runner in R-multiples (e.g., 3.0R)')
+    parser.add_argument('--v2-entry-confirm-ema', action='store_true', help='Require EMA9>EMA20 on BFSv2 entry')
+    parser.add_argument('--v2-entry-confirm-macd', action='store_true', help='Require MACD bullish (macd>signal and hist>0) on BFSv2 entry')
+    parser.add_argument('--v2-entry-confirmations', choices=['both','macd_only','ema_only','none'], default='none', help='BFSv2: select which confirmations to require (overrides individual flags)')
+    parser.add_argument('--v2-enter-on-close-with-gate', action='store_true', help='When volume gate active, enter on bar close instead of intrabar breakout')
+    parser.add_argument('--v2-min-stop-dollars', type=float, default=0.10, help='Minimum stop distance (dollars) for BFSv2 sizing/targets')
+    # MACD gate + structure knobs
+    parser.add_argument('--v2-macd-gate-require-runner', dest='v2_macd_gate_require_runner', action='store_true', help='Require runner (post-partial) for MACD gate at T+X (default)')
+    parser.add_argument('--no-v2-macd-gate-require-runner', dest='v2_macd_gate_require_runner', action='store_false', help='Apply MACD gate at T+X even without runner (full position)')
+    parser.set_defaults(v2_macd_gate_require_runner=True)
+    parser.add_argument('--v2-macd-gate-require-no-progress', action='store_true', help='Require no progress (max-high ≤ entry + thresh_R×R) to trigger MACD gate')
+    parser.add_argument('--v2-no-progress-thresh-r', type=float, default=0.0, help='No-progress threshold in R for MACD gate (e.g., 0.1)')
+    parser.add_argument('--v2-max-wait-bars', type=int, default=6, help='BFSv2: bars to wait from first red after alert before timing out')
+    parser.add_argument('--v2-retrace-cap-pct', type=float, default=0.50, help='BFSv2: pullback retrace cap as fraction of pole height (0-1)')
+    parser.add_argument('--v2-require-vwap-above', action='store_true', help='BFSv2: require price >= VWAP at entry')
+    parser.add_argument('--v2-entry-confirm-ema5m', action='store_true', help='BFSv2: require EMA9>EMA20 on 5-min timeframe at entry')
     parser.add_argument('--symbols', help='Comma-separated symbols to include (e.g., BSLK,DOGZ)')
     parser.add_argument('--exclude-symbols', help='Comma-separated symbols to exclude')
     parser.add_argument('--symbols-file', help='Path to file with one or comma-separated symbols per line')
@@ -847,6 +889,25 @@ if __name__ == "__main__":
         (f"${args.max_daily_loss:.0f}" if args.max_daily_loss is not None else "<none>"),
         float(args.breakout_vol_mult or 0.0),
         float(args.min_pullback_avg_volume or 0.0),
+    )
+    logging.info(
+        "BFSv2: runner=%s | macd_gate=%d | hard_cap_R=%.1f | partial_on_alert_high=%s | enter_on_close_gate=%s | min_stop=$%.2f",
+        "on" if args.v2_runner_enabled else "off",
+        int(args.v2_runner_macd_gate_minutes or 10),
+        float(args.v2_runner_hard_cap_r or 3.0),
+        "on" if args.v2_partial_on_alert_high else "off",
+        "on" if args.v2_enter_on_close_with_gate else "off",
+        float(args.v2_min_stop_dollars or 0.10),
+    )
+    logging.info(
+        "BFSv2 extras: macd_gate_require_runner=%s | require_no_progress=%s | no_progress_R=%.2f | max_wait_bars=%d | retrace_cap=%.2f | vwap_guard=%s | ema5m=%s",
+        bool(getattr(args, 'v2_macd_gate_require_runner', True)),
+        bool(getattr(args, 'v2_macd_gate_require_no_progress', False)),
+        float(getattr(args, 'v2_no_progress_thresh_r', 0.0) or 0.0),
+        int(getattr(args, 'v2_max_wait_bars', 6) or 6),
+        float(getattr(args, 'v2_retrace_cap_pct', 0.50) or 0.50),
+        bool(getattr(args, 'v2_require_vwap_above', False)),
+        bool(getattr(args, 'v2_entry_confirm_ema5m', False)),
     )
     def _load_symfile(p):
         if not p:

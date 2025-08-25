@@ -70,12 +70,17 @@ class PositionTracker:
     Enforces maximum positions and daily risk budgets
     """
     
-    def __init__(self, account_balance: float, max_positions: int = MAX_CONCURRENT_POSITIONS, 
-                 daily_risk_percentage: float = DAILY_RISK_PCT):
+    def __init__(self, account_balance: float, max_positions: int = MAX_CONCURRENT_POSITIONS,
+                 daily_risk_percentage: float = DAILY_RISK_PCT,
+                 max_daily_loss: Optional[float] = None):
         self.account_balance = account_balance
         self.max_positions = max_positions
         self.daily_risk_percentage = daily_risk_percentage
         self.daily_risk_budget = account_balance * daily_risk_percentage
+        # Hard daily stop configuration and tracking
+        self.max_daily_loss: Optional[float] = (abs(max_daily_loss) if max_daily_loss is not None else None)
+        self.realized_pnl_today: float = 0.0
+        self.daily_stop_hit: bool = False
         
         # Position tracking
         self.active_positions: Dict[str, TrackedPosition] = {}
@@ -99,6 +104,8 @@ class PositionTracker:
         """Reset daily risk tracking (called at market open)"""
         self.daily_risk_used = 0.0
         self.current_date = datetime.now().date()
+        self.realized_pnl_today = 0.0
+        self.daily_stop_hit = False
         
         # Move closed positions to history
         for symbol in list(self.active_positions.keys()):
@@ -118,6 +125,9 @@ class PositionTracker:
         # Check if it's a new day (reset limits automatically)
         if datetime.now().date() != self.current_date:
             self.reset_daily_limits()
+        # Block if daily stop hit
+        if self.should_halt_trading():
+            return False, "Daily stop hit — halting new entries"
         
         # Check maximum positions limit
         active_count = len([p for p in self.active_positions.values() 
@@ -133,6 +143,26 @@ class PositionTracker:
                          f"${remaining:.0f} remaining of ${self.daily_risk_budget:.0f} budget"
         
         return True, "Position approved within risk limits"
+
+    # Hard daily stop accounting
+    def record_realized_pnl(self, delta: float) -> None:
+        """Record realized P&L impact and evaluate daily stop."""
+        try:
+            self.realized_pnl_today += float(delta)
+        except Exception:
+            return
+        if self.max_daily_loss is not None and self.realized_pnl_today <= -self.max_daily_loss:
+            self.daily_stop_hit = True
+            logging.warning(
+                "⛔ Daily loss limit reached: realized=$%.0f ≤ -$%.0f. Halting new entries.",
+                self.realized_pnl_today, self.max_daily_loss
+            )
+
+    def should_halt_trading(self) -> bool:
+        """Return True if the daily stop has been hit."""
+        if self.max_daily_loss is None:
+            return False
+        return self.daily_stop_hit
     
     def add_position(self, symbol: str, entry_time: datetime, entry_price: float,
                     shares: int, risk_amount: float, stop_loss: float) -> None:
@@ -222,6 +252,8 @@ class PositionTracker:
         
         logging.info(f"Closed {symbol}: {position.current_shares} shares at ${exit_price:.2f}, "
                     f"realized P&L: ${realized_pnl:+.0f}")
+        # Update realized P&L tally and evaluate daily stop
+        self.record_realized_pnl(realized_pnl)
         
         return realized_pnl
     
