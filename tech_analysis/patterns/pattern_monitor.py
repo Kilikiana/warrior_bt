@@ -262,6 +262,15 @@ class PatternMonitoringSession:
         # Apply config
         cfg = config or SessionConfig()
         self.account_balance = cfg.account_balance
+        # Expose volume gates for simple strategies (v2 reads from session)
+        try:
+            self.breakout_vol_mult = float(getattr(cfg, 'breakout_vol_mult', 0.0) or 0.0)
+        except Exception:
+            self.breakout_vol_mult = 0.0
+        try:
+            self.min_pullback_avg_volume = float(getattr(cfg, 'min_pullback_avg_volume', 0.0) or 0.0)
+        except Exception:
+            self.min_pullback_avg_volume = 0.0
         self.position_sizer = position_sizer
         self.sizing_method = cfg.sizing_method
         self.use_5min_first_red_exit = cfg.use_5min_first_red_exit
