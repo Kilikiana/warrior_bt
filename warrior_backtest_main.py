@@ -229,20 +229,7 @@ def run_backtest(
                     clustered_any = False
                     def _ts(hm: str) -> datetime:
                         return datetime.strptime(f"{date} {hm}", "%Y-%m-%d %H:%M")
-                    # Pre-filter: ignore ACTION alerts that occur on a red candle
-                    def _is_red_at(ts: datetime) -> bool:
-                        try:
-                            if ts in ohlc_df.index:
-                                r = ohlc_df.loc[ts]
-                            else:
-                                pos = ohlc_df.index.get_indexer([ts], method='pad')
-                                r = ohlc_df.iloc[int(pos[0])] if pos[0] != -1 else None
-                            if r is None:
-                                return False
-                            return float(r['close']) < float(r['open'])
-                        except Exception:
-                            return False
-                    sym_alerts = [a for a in sym_alerts if not _is_red_at(_ts(a.get('time','')))]
+                    # Removed red-alert prefilter to preserve original alert stream
                     n = len(sym_alerts)
                     idx = 0
                     while idx < n:
@@ -604,15 +591,17 @@ def run_backtest(
                     from datetime import timedelta as _td
                     warmup_minutes = 40
                     slice_start = alert_time - _td(minutes=warmup_minutes)
-                    try:
-                        slice_end = datetime.strptime(f"{date} {end_time}", "%Y-%m-%d %H:%M")
-                    except Exception:
+                    # Decide end of slice: if managing past end, run to last available bar; else clamp at end_time
+                    if bool(getattr(args, 'manage_past_end', True)):
                         slice_end = ohlc_data.index.max()
-                    # For alert_flip only, slice through the first non-alert minute after alert
+                    else:
+                        try:
+                            slice_end = datetime.strptime(f"{date} {end_time}", "%Y-%m-%d %H:%M")
+                        except Exception:
+                            slice_end = ohlc_data.index.max()
+                    # For alert_flip only, slice through the first non-alert minute after alert (preserve behavior)
                     if getattr(args, 'pattern', 'bull_flag') in ('alert_flip',):
-                        from datetime import timedelta as _td
-                        # Include all bars from alert_time up to the first non-alert minute (cap +30m).
-                        # This allows exits on red alert bars if they occur, or on the first non-alert bar.
+                        # Include all bars from alert_time up to the first non-alert minute (cap +30m or slice_end)
                         try:
                             sym_alerts_all = alerts_by_symbol.get(symbol.upper(), [])
                             alert_set = set(datetime.strptime(f"{date} {a.get('time','')}", "%Y-%m-%d %H:%M") for a in sym_alerts_all)
@@ -624,10 +613,6 @@ def run_backtest(
                         while t in alert_set and t <= limit:
                             t = t + _td(minutes=1)
                         slice_end = min(limit, t)
-                    # For bull_flag_simple, honor MACD exits beyond next alert: keep slice to end_time
-                    elif getattr(args, 'pattern', 'bull_flag') == 'bull_flag_simple':
-                        # slice_end already set to end_time above; no change here to allow MACD-driven exits
-                        pass
                     # Clamp slice_start to available data start
                     try:
                         data_start = ohlc_data.index.min()
