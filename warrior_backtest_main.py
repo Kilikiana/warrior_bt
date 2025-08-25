@@ -229,8 +229,22 @@ def run_backtest(
                     clustered_any = False
                     def _ts(hm: str) -> datetime:
                         return datetime.strptime(f"{date} {hm}", "%Y-%m-%d %H:%M")
-                    idx = 0
+                    # Pre-filter: ignore ACTION alerts that occur on a red candle
+                    def _is_red_at(ts: datetime) -> bool:
+                        try:
+                            if ts in ohlc_df.index:
+                                r = ohlc_df.loc[ts]
+                            else:
+                                pos = ohlc_df.index.get_indexer([ts], method='pad')
+                                r = ohlc_df.iloc[int(pos[0])] if pos[0] != -1 else None
+                            if r is None:
+                                return False
+                            return float(r['close']) < float(r['open'])
+                        except Exception:
+                            return False
+                    sym_alerts = [a for a in sym_alerts if not _is_red_at(_ts(a.get('time','')))]
                     n = len(sym_alerts)
+                    idx = 0
                     while idx < n:
                         clustered_any = True
                         seed = sym_alerts[idx]

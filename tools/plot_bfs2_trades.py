@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 
 from core.config import RESULTS_DIR
 import matplotlib.gridspec as gridspec
+import matplotlib.dates as mdates
 from data.ohlc_loader import load_symbol_ohlc_data
 
 
@@ -172,16 +173,22 @@ def plot_trades(date: str, symbol: str, outdir: Optional[Path] = None, sessions_
         ax.scatter([entry_time], [entry_price], color='#2e7d32', marker='^', s=80, zorder=3, label='Entry')
         if exit_time is not None and pd.notna(exit_price):
             ax.scatter([exit_time], [exit_price], color='#d32f2f', marker='v', s=80, zorder=3, label='Exit')
-        # Last red high line (trigger)
+        # Last pullback candle high line (trigger)
         if lrh is not None:
-            ax.axhline(lrh, color='#f9a825', linestyle=':', linewidth=1.2, label='Last Red High')
+            ax.axhline(lrh, color='#f9a825', linestyle=':', linewidth=1.2, label='Last Pullback Candle High')
 
-        # Volume bars (colored by candle direction)
+        # Volume bars (colored by candle direction) — use proper datetime width
         try:
             vol_colors = ['#26a69a' if float(window.loc[t, 'close']) >= float(window.loc[t, 'open']) else '#ef5350' for t in window.index]
         except Exception:
-            vol_colors = '#90a4ae'
-        axv.bar(window.index, window['volume'], width=0.0006 * len(window) if len(window) > 0 else 0.5, color=vol_colors, alpha=0.6)
+            vol_colors = ['#90a4ae'] * len(window)
+        # Convert timestamps to matplotlib date numbers for correct width units
+        x_nums = mdates.date2num(window.index.to_pydatetime())
+        if len(x_nums) >= 2:
+            bar_width = (x_nums[1] - x_nums[0]) * 0.8  # ~80% of 1-bar width
+        else:
+            bar_width = (1.0 / 1440.0) * 0.8  # 1 minute in days
+        axv.bar(x_nums, window['volume'].values, width=bar_width, color=vol_colors, alpha=0.6, align='center', linewidth=0)
         axv.set_ylabel('Volume')
         axv.grid(True, axis='y', linestyle=':', alpha=0.3)
 
