@@ -260,22 +260,6 @@ class BullFlagSimpleV2Strategy:
                             try:
                                 shares_to_sell = max(1, int(session.position.current_shares * 0.5))
                                 session._partial_exit(timestamp, price, session.ExitReason.FIRST_TARGET, shares_to_sell)
-                                # Move stop to breakeven on remaining
-                                try:
-                                    if session.position and session.position.current_shares > 0:
-                                        new_stop = max(float(session.position.stop_loss), float(session.position.entry_price))
-                                        remaining = int(session.position.current_shares) - int(shares_to_sell)
-                                        if remaining < 0:
-                                            remaining = 0
-                                        session.position = session.position._replace(
-                                            current_shares=remaining,
-                                            stop_loss=new_stop,
-                                            status=session.TradeStatus.SCALED_FIRST if remaining > 0 else session.TradeStatus.EXITED
-                                        )
-                                        if remaining == 0:
-                                            session.status = session.MonitoringStatus.MONITORING_STOPPED
-                                except Exception:
-                                    pass
                                 self._first_target_done = True
                                 # Clear target to avoid repeated scales in v2 simple mode
                                 self._target_price = None
@@ -289,22 +273,6 @@ class BullFlagSimpleV2Strategy:
                             try:
                                 shares_to_sell = max(1, int(session.position.current_shares * 0.5))
                                 session._partial_exit(timestamp, price, session.ExitReason.FIRST_TARGET, shares_to_sell)
-                                # Move stop to breakeven on remaining
-                                try:
-                                    if session.position and session.position.current_shares > 0:
-                                        new_stop = max(float(session.position.stop_loss), float(session.position.entry_price))
-                                        remaining = int(session.position.current_shares) - int(shares_to_sell)
-                                        if remaining < 0:
-                                            remaining = 0
-                                        session.position = session.position._replace(
-                                            current_shares=remaining,
-                                            stop_loss=new_stop,
-                                            status=session.TradeStatus.SCALED_FIRST if remaining > 0 else session.TradeStatus.EXITED
-                                        )
-                                        if remaining == 0:
-                                            session.status = session.MonitoringStatus.MONITORING_STOPPED
-                                except Exception:
-                                    pass
                                 self._first_target_done = True
                                 # Clear target to avoid repeated scales in v2 simple mode
                                 self._target_price = None
@@ -321,8 +289,15 @@ class BullFlagSimpleV2Strategy:
                         session._exit_position(timestamp, price, session.ExitReason.FIRST_TARGET, session.position.current_shares)
                         self._exit_pending = False
                         return True
-                    # 2) Stop loss hit: simulate intrabar stop fill (open gap or low breach)
-                    stop = float(self._stop_price) if self._stop_price is not None else float(getattr(session.position, 'stop_loss', 0.0) or 0.0)
+                    # 2) Stop loss hit: prefer current position stop (e.g., breakeven after partial),
+                    #    else fallback to initial pivot-low stop
+                    pos_stop = 0.0
+                    try:
+                        if session.position is not None:
+                            pos_stop = float(getattr(session.position, 'stop_loss', 0.0) or 0.0)
+                    except Exception:
+                        pos_stop = 0.0
+                    stop = pos_stop if pos_stop > 0.0 else (float(self._stop_price) if self._stop_price is not None else 0.0)
                     if stop > 0.0:
                         stop_hit = False
                         stop_fill = None

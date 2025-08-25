@@ -1433,7 +1433,35 @@ class PatternMonitoringSession:
                     self._tracker.record_realized_pnl(realized)
         except Exception as e:
             logging.debug("Tracker integration failed on partial exit for %s: %s", self.symbol, e)
-        
+
+        # Reduce in-session shares and optionally move stop to breakeven
+        try:
+            if self.position is not None:
+                remaining = max(0, int(self.position.current_shares) - int(shares))
+                new_stop = float(self.position.stop_loss)
+                if reason == ExitReason.FIRST_TARGET:
+                    # Move stop to breakeven after first target
+                    try:
+                        new_stop = max(float(self.position.stop_loss), float(self.position.entry_price))
+                    except Exception:
+                        new_stop = float(self.position.stop_loss)
+                # Update position
+                new_status = self.position.status
+                if remaining <= 0:
+                    new_status = TradeStatus.EXITED
+                else:
+                    # If we sold a meaningful chunk, consider scaled_first vs scaling_out
+                    new_status = TradeStatus.SCALED_FIRST if remaining <= int(self.position.initial_shares * 0.5) else TradeStatus.SCALING_OUT
+                self.position = self.position._replace(
+                    current_shares=remaining,
+                    stop_loss=new_stop,
+                    status=new_status
+                )
+                if remaining <= 0:
+                    self.status = MonitoringStatus.MONITORING_STOPPED
+        except Exception as e:
+            logging.debug("Failed to update in-session position on partial for %s: %s", self.symbol, e)
+
         # Calculate R-multiple for the partial if it's first target
         if reason == ExitReason.FIRST_TARGET and self.position:
             risk_per_share = self.position.entry_price - self.position.stop_loss  # Original stop before BE move
