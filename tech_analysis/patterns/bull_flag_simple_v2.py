@@ -132,11 +132,41 @@ class BullFlagSimpleV2Strategy:
                         is_red = cur_close < cur_open
                     except Exception:
                         is_red = False
+                    # Trace exit check for debugging
+                    try:
+                        logging.info(
+                            "BFSv2 exit-check: %s | bar=%s open=%.4f close=%.4f is_red=%s entry_idx=%s",
+                            getattr(session, 'symbol', '?'),
+                            str(df.index[-1]),
+                            float(df['open'].iloc[-1]) if 'open' in df.columns else float('nan'),
+                            float(df['close'].iloc[-1]) if 'close' in df.columns else float('nan'),
+                            str(is_red),
+                            str(self._entry_index)
+                        )
+                    except Exception:
+                        pass
                     if is_red:
                         exit_price = float(df['close'].iloc[-1])
-                        session._exit_position(timestamp, exit_price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
-                        self._exit_pending = False
-                        return True
+                        try:
+                            logging.info(
+                                "BFSv2 exit: %s | bar=%s price=%.4f (first red after entry)",
+                                getattr(session, 'symbol', '?'),
+                                str(df.index[-1]),
+                                float(exit_price)
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            session._exit_position(timestamp, exit_price, session.ExitReason.NEXT_BAR_CLOSE, session.position.current_shares)
+                            self._exit_pending = False
+                            return True
+                        except Exception as e:
+                            try:
+                                logging.warning("BFSv2 exit error for %s at %s: %s", getattr(session, 'symbol', '?'), str(df.index[-1]), e)
+                            except Exception:
+                                pass
+                            # Do not swallow; keep exit pending for next bar
+                            return False
                     else:
                         return False
         except Exception:
