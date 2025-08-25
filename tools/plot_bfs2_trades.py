@@ -18,6 +18,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from core.config import RESULTS_DIR
+import matplotlib.gridspec as gridspec
 from data.ohlc_loader import load_symbol_ohlc_data
 
 
@@ -147,12 +148,24 @@ def plot_trades(date: str, symbol: str, outdir: Optional[Path] = None, sessions_
         if window.empty:
             continue
 
-        fig, ax = plt.subplots(figsize=(12, 6))
+        # Layout with volume sub-plot
+        fig = plt.figure(figsize=(12, 6))
+        gs = gridspec.GridSpec(5, 1, figure=fig)
+        ax = fig.add_subplot(gs[0:3, 0])
+        axv = fig.add_subplot(gs[3:5, 0], sharex=ax)
+
         _plot_candles(ax, window)
-        ax.set_title(f"{symbol.upper()} {date} | Alert {alert_time.strftime('%H:%M')} | Entry {entry_time.strftime('%H:%M')} @ {entry_price:.2f}")
+        title = (
+            f"{symbol.upper()} {date} | "
+            f"Alert {alert_time.strftime('%H:%M')} | "
+            f"Entry {entry_time.strftime('%H:%M')} @ {entry_price:.2f}"
+        )
+        if exit_time is not None and pd.notna(exit_price):
+            title += f" | Exit {exit_time.strftime('%H:%M')} @ {float(exit_price):.2f}"
+        ax.set_title(title)
         ax.set_ylabel("Price")
 
-        # Markers
+        # Markers on price
         ax.axvline(alert_time, color='#1976d2', linestyle='--', linewidth=1.0, label='Alert')
         if fr is not None:
             ax.axvline(fr, color='#8e24aa', linestyle='--', linewidth=1.0, label='First Red')
@@ -163,10 +176,20 @@ def plot_trades(date: str, symbol: str, outdir: Optional[Path] = None, sessions_
         if lrh is not None:
             ax.axhline(lrh, color='#f9a825', linestyle=':', linewidth=1.2, label='Last Red High')
 
+        # Volume bars (colored by candle direction)
+        try:
+            vol_colors = ['#26a69a' if float(window.loc[t, 'close']) >= float(window.loc[t, 'open']) else '#ef5350' for t in window.index]
+        except Exception:
+            vol_colors = '#90a4ae'
+        axv.bar(window.index, window['volume'], width=0.0006 * len(window) if len(window) > 0 else 0.5, color=vol_colors, alpha=0.6)
+        axv.set_ylabel('Volume')
+        axv.grid(True, axis='y', linestyle=':', alpha=0.3)
+
         ax.legend(loc='best')
         fig.autofmt_xdate()
 
-        outfile = outdir / f"{symbol.upper()}_{entry_time.strftime('%H%M')}.png"
+        exit_tag = exit_time.strftime('%H%M') if exit_time is not None else 'NA'
+        outfile = outdir / f"{symbol.upper()}_{entry_time.strftime('%H%M')}_{exit_tag}.png"
         fig.savefig(outfile, dpi=140, bbox_inches='tight')
         plt.close(fig)
         outputs.append(outfile)
