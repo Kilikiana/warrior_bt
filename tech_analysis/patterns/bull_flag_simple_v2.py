@@ -51,6 +51,8 @@ class BullFlagSimpleV2Strategy:
         self._initial_stop_price: Optional[float] = None
         self._initial_rps: Optional[float] = None
         self._runner_hard_cap_price: Optional[float] = None
+        # Tracking for giveback and weakness
+        self._max_price_since_partial: Optional[float] = None
 
     def on_bar(self, session, df: pd.DataFrame, timestamp: datetime) -> bool:
         # Entry: after ACTION alert, wait for a contiguous red pullback, then
@@ -254,6 +256,18 @@ class BullFlagSimpleV2Strategy:
                                     except Exception:
                                         self._target_price = None
                                         self._fallback_target = False
+                                # Require 2R potential if enabled
+                                try:
+                                    if getattr(session, 'v2_require_2r_potential', False) and self._stop_price is not None:
+                                        rps = float(entry_price) - float(self._stop_price)
+                                        if rps <= 0:
+                                            return False
+                                        tgt = float(self._target_price) if self._target_price is not None else float('nan')
+                                        if tgt == tgt:  # valid
+                                            if (tgt - float(entry_price)) < 2.0 * rps - 1e-9:
+                                                return False
+                                except Exception:
+                                    pass
                                 # Entry confirmations (optional): EMA9>EMA20 and/or MACD bullish; optional 5-min EMA trend
                                 try:
                                     # Determine which bar's indicators to use
@@ -334,10 +348,12 @@ class BullFlagSimpleV2Strategy:
                                     self._initial_entry_price = float(entry_price)
                                     self._initial_stop_price = float(stop_loss)
                                     self._initial_rps = max(0.0, float(entry_price) - float(stop_loss))
+                                    self._max_price_since_partial = float(entry_price)
                                 except Exception:
                                     self._initial_entry_price = float(entry_price)
                                     self._initial_stop_price = float(stop_loss)
                                     self._initial_rps = None
+                                    self._max_price_since_partial = float(entry_price)
                                 # Immediate exit if entry bar closes red
                                 try:
                                     if cur_close < cur_open and session.position is not None:
@@ -465,6 +481,7 @@ class BullFlagSimpleV2Strategy:
                                         cap_r = float(getattr(session, 'v2_runner_hard_cap_R', 3.0) or 3.0)
                                         if cap_r > 0.0 and self._initial_rps > 0.0:
                                             self._runner_hard_cap_price = float(self._initial_entry_price) + cap_r * float(self._initial_rps)
+                                    self._max_price_since_partial = float(price)
                                 except Exception:
                                     pass
                                 return True
@@ -486,6 +503,7 @@ class BullFlagSimpleV2Strategy:
                                         cap_r = float(getattr(session, 'v2_runner_hard_cap_R', 3.0) or 3.0)
                                         if cap_r > 0.0 and self._initial_rps > 0.0:
                                             self._runner_hard_cap_price = float(self._initial_entry_price) + cap_r * float(self._initial_rps)
+                                    self._max_price_since_partial = float(price)
                                 except Exception:
                                     pass
                                 return True
@@ -578,8 +596,76 @@ class BullFlagSimpleV2Strategy:
                                 new_trail = max(new_trail, be_floor)
                                 if new_trail > float(session.position.stop_loss) + 1e-6:
                                     session.position = session.position._replace(stop_loss=new_trail)
+                            # Track max since partial for giveback logic
+                            try:
+                                self._max_price_since_partial = max(float(self._max_price_since_partial or cur_high), cur_high)
+                            except Exception:
+                                self._max_price_since_partial = cur_high
                         except Exception:
                             pass
+                    # 4) No-progress time gate: exit at T+N if no push above entry and (optionally) MACD bearish
+                    try:
+                        np_minutes = int(getattr(session, 'v2_no_progress_exit_minutes', 0) or 0)
+                    except Exception:
+                        np_minutes = 0
+                    if np_minutes > 0 and self._entry_index is not None and session.position is not None:
+                        try:
+                            if df.index[-1] >= (self._entry_index + pd.Timedelta(minutes=np_minutes)):
+                                # Check if price ever traded above entry
+                                hi_since = float(df.loc[df.index > self._entry_index, 'high'].max())
+                                crossed = (hi_since > float(self._initial_entry_price) + 1e-9) if self._initial_entry_price is not None else True
+                                macd_ok = True
+                                if bool(getattr(session, 'v2_no_progress_exit_macd_only', True)):
+                                    macd_val = df.get('macd', pd.Series(dtype=float)).iloc[-1]
+                                    macd_sig = df.get('macd_signal', pd.Series(dtype=float)).iloc[-1]
+                                    macd_hist = df.get('macd_hist', pd.Series(dtype=float)).iloc[-1]
+                                    macd_ok = (pd.notna(macd_val) and pd.notna(macd_sig) and pd.notna(macd_hist) and (float(macd_val) < float(macd_sig) or float(macd_hist) <= 0.0))
+                                if (not crossed) and macd_ok:
+                                    session._exit_position(timestamp, float(cur_close), session.ExitReason.BREAKOUT_OR_BAILOUT, session.position.current_shares)
+                                    self._exit_pending = False
+                                    return True
+                        except Exception:
+                            pass
+                    # 5) Weakness exit in first M bars: close below VWAP/EMA9
+                    try:
+                        wb = int(getattr(session, 'v2_weakness_exit_bars', 0) or 0)
+                    except Exception:
+                        wb = 0
+                    if wb > 0 and self._entry_index is not None and session.position is not None:
+                        try:
+                            bars = int((df.index > self._entry_index).sum())
+                        except Exception:
+                            bars = 0
+                        if bars <= wb:
+                            vwap_ok = True
+                            ema_ok = True
+                            try:
+                                vwap_val = df.get('vwap', None)
+                                if vwap_val is not None:
+                                    vwap_ok = float(cur_close) >= float(vwap_val.iloc[-1])
+                            except Exception:
+                                vwap_ok = True
+                            try:
+                                ema9_val = df.get('ema9', None)
+                                if ema9_val is not None:
+                                    ema_ok = float(cur_close) >= float(ema9_val.iloc[-1])
+                            except Exception:
+                                ema_ok = True
+                            if not (vwap_ok and ema_ok):
+                                session._exit_position(timestamp, float(cur_close), session.ExitReason.NO_IMMEDIATE_BREAKOUT, session.position.current_shares)
+                                self._exit_pending = False
+                                return True
+                    # 6) Giveback exit after partial: if price gives back > frac of max-open R, exit remainder
+                    try:
+                        gb = float(getattr(session, 'v2_giveback_exit_frac', 0.0) or 0.0)
+                    except Exception:
+                        gb = 0.0
+                    if gb > 0.0 and self._first_target_done and session.position is not None and self._initial_rps is not None and self._initial_rps > 0 and self._max_price_since_partial is not None:
+                        drop_r = (float(self._max_price_since_partial) - float(cur_close)) / float(self._initial_rps)
+                        if drop_r >= gb - 1e-9:
+                            session._exit_position(timestamp, float(cur_close), session.ExitReason.NO_IMMEDIATE_BREAKOUT, session.position.current_shares)
+                            self._exit_pending = False
+                            return True
         except Exception:
             pass
 

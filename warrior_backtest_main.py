@@ -97,6 +97,13 @@ def setup_logging(log_file: str | None = None, log_level: str = "INFO") -> None:
             logger.warning(f"Failed to initialize file logging at {log_file}: {e}")
 
     logger.info("Logging initialized | level=%s | file=%s", logging.getLevelName(level), log_file or "<console-only>")
+    # Include git SHA (if available) for reproducibility
+    try:
+        import subprocess
+        sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+        logger.info("Git SHA: %s", sha)
+    except Exception:
+        pass
 
 
 
@@ -148,34 +155,176 @@ def run_backtest(
     logging.info("🚀 Running Ross Cameron Backtest: %s (%s - %s)", date, start_time, end_time)
     logging.info("💰 Account Balance: $%s", f"{account_balance:,}")
     
-    # Load ACTION alerts for the date
+    # Load ACTION alerts for the date (skip if seeding from gappers)
+    seed_mode = getattr(args, 'seed_mode', 'alerts') if 'args' in globals() else 'alerts'
+    scan_data = {}
     alerts_file = get_scan_file(date)
-    if not alerts_file.exists():
-        logging.warning("No alerts found for %s", date)
-        return
+    if seed_mode == 'alerts':
+        if not alerts_file.exists():
+            logging.warning("No alerts found for %s", date)
+            return
+        with open(alerts_file) as f:
+            scan_data = json.load(f)
     
-    with open(alerts_file) as f:
-        scan_data = json.load(f)
-    
-    # Get all alerts and filter for ACTION alerts (STRONG_SQUEEZE_HIGH_RVOL) in time window
-    all_alerts = scan_data.get('all_alerts', [])
+    # Build alert stream
     # Optional symbol filtering
     symbols_set = set(s.upper() for s in symbols) if symbols else None
     exclude_set = set(s.upper() for s in exclude_symbols) if exclude_symbols else None
-    # Group alerts by symbol (preserve those in the time window)
     alerts_by_symbol: Dict[str, List[dict]] = {}
-    for alert in all_alerts:
-        if alert.get('strategy') != 'STRONG_SQUEEZE_HIGH_RVOL':
-            continue
-        t = str(alert.get('time', ''))
-        if not (start_time <= t <= end_time):
-            continue
-        symu = str(alert.get('symbol','')).upper()
-        if symbols_set is not None and symu not in symbols_set:
-            continue
-        if exclude_set is not None and symu in exclude_set:
-            continue
-        alerts_by_symbol.setdefault(symu, []).append(dict(alert))
+    seed_mode = getattr(args, 'seed_mode', 'alerts') if 'args' in globals() else 'alerts'
+    if seed_mode == 'alerts':
+        # Use ACTION alerts (STRONG_SQUEEZE_HIGH_RVOL)
+        all_alerts = scan_data.get('all_alerts', [])
+        for alert in all_alerts:
+            if alert.get('strategy') != 'STRONG_SQUEEZE_HIGH_RVOL':
+                continue
+            t = str(alert.get('time', ''))
+            if not (start_time <= t <= end_time):
+                continue
+            symu = str(alert.get('symbol','')).upper()
+            if symbols_set is not None and symu not in symbols_set:
+                continue
+            if exclude_set is not None and symu in exclude_set:
+                continue
+            alerts_by_symbol.setdefault(symu, []).append(dict(alert))
+    else:
+        # Seed from Top Gappers at 9:30 using results/criteria_scans open_gap_results
+        import csv as _csv
+        from pathlib import Path as _Path
+        gap_file = _Path('results/criteria_scans/open_gap_results.csv')
+        # Try dated file fallback
+        if not gap_file.exists():
+            import glob as _glob
+            cands = sorted(_glob.glob(f"results/criteria_scans/open_gap_results_{date}_*.csv"))
+            gap_file = _Path(cands[0]) if cands else gap_file
+        # If still missing, compute a simple fallback from cached bars
+        if not gap_file.exists():
+            try:
+                from tools.simple_gappers import compute_open_gappers
+                gap_file = compute_open_gappers(date, min_gap_pct=float(getattr(args, 'gng_min_gap_pct', 4.0) or 4.0))
+                logging.info("Generated fallback top gappers: %s", gap_file)
+            except Exception as e:
+                logging.info("Failed to generate fallback gappers: %s", e)
+        gap_rows: List[dict] = []
+        if gap_file.exists():
+            try:
+                with open(gap_file, 'r') as f:
+                    reader = _csv.DictReader(f)
+                    for row in reader:
+                        # accept both standard and fallback csv
+                        if row.get('date') == date or gap_file.name.endswith('_fallback.csv'):
+                            gap_rows.append(row)
+            except Exception:
+                gap_rows = []
+        # Best-effort float map from HOD scanner (if present)
+        hod_float_map = {}
+        try:
+            from core.config import get_scan_file as _get_scan
+            _af = _get_scan_file(date) if 'get_scan_file' in globals() else None
+        except Exception:
+            _af = None
+        if _af and _af.exists():
+            try:
+                import json as _json
+                _d = _json.load(open(_af))
+                for a in _d.get('all_alerts', []):
+                    symu = str(a.get('symbol','')).upper()
+                    if 'float' in a and symu not in hod_float_map:
+                        try:
+                            hod_float_map[symu] = float(a['float'])
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        # Compute/attach premarket volume if not present
+        def _compute_pm_vol(sym: str) -> int:
+            try:
+                import json, gzip
+                from core.config import OHLCV_1MIN_DIR as _MIN_DIR
+                p = _MIN_DIR / f"ohlcv_1min_{date}.json.gz"
+                if not p.exists():
+                    return 0
+                with gzip.open(p, 'rt') as f:
+                    allm = json.load(f)
+                rec = next((r for r in allm if r.get('symbol') == sym), None)
+                if not rec:
+                    return 0
+                minutes = rec.get('minutes') or rec.get('bars') or []
+                tot = 0
+                for m in minutes:
+                    t = m.get('time')
+                    if t and '04:00' <= t < '09:30':
+                        tot += int(m.get('volume') or 0)
+                return tot
+            except Exception:
+                return 0
+        # Apply min premarket volume and rank by gap%
+        min_pm = int(getattr(args, 'gappers_min_premarket_volume', 0) or 0)
+        ranked: List[dict] = []
+        for r in gap_rows:
+            try:
+                symu = str(r.get('symbol','')).upper()
+                pmv = int(float(r.get('premarket_volume') or 0))
+                if pmv == 0:
+                    pmv = _compute_pm_vol(symu)
+                if min_pm > 0 and pmv < min_pm:
+                    continue
+                r['premarket_volume'] = pmv
+                ranked.append(r)
+            except Exception:
+                continue
+        ranked.sort(key=lambda x: float(x.get('gap_pct') or 0.0), reverse=True)
+        top_n = max(1, int(getattr(args, 'gappers_top_n', 5) or 5))
+        ranked = ranked[:top_n]
+        # Load simple news table if available to provide a catalyst string
+        news_map = {}
+        try:
+            news_file = _Path('results/criteria_scans/backtest_news_results.csv')
+            if news_file.exists():
+                with open(news_file, 'r') as nf:
+                    nreader = _csv.DictReader(nf)
+                    for r in nreader:
+                        sym = str(r.get('symbol','')).upper()
+                        headline = r.get('first_headline') or ''
+                        try:
+                            cnt = int(float(r.get('news_count') or 0))
+                        except Exception:
+                            cnt = 0
+                        news_map[sym] = (cnt, headline)
+        except Exception:
+            news_map = {}
+        # Build pseudo-alerts at 09:30 (selected)
+        for r in ranked:
+            try:
+                symu = str(r.get('symbol','')).upper()
+                if not symu:
+                    continue
+                if symbols_set is not None and symu not in symbols_set:
+                    continue
+                if exclude_set is not None and symu in exclude_set:
+                    continue
+                open_price = float(r.get('open_price') or r.get('open') or 0.0)
+                prev_close = float(r.get('prev_close') or 0.0)
+                gap_pct = float(r.get('gap_pct') or 0.0)
+                # Respect Gap & Go min gap
+                min_gap = float(getattr(args, 'gng_min_gap_pct', 4.0) or 4.0)
+                if gap_pct < min_gap:
+                    continue
+                # Time at 09:30
+                t = '09:30'
+                alert = {
+                    'symbol': symu,
+                    'time': t,
+                    'price': open_price,
+                    'strategy': 'STRONG_SQUEEZE_HIGH_RVOL',
+                    'description': (news_map.get(symu, (0, ''))[1] if news_map else ''),
+                    'prev_close': prev_close,
+                    'float': hod_float_map.get(symu),
+                    'premarket_volume': r.get('premarket_volume'),
+                }
+                alerts_by_symbol.setdefault(symu, []).append(alert)
+            except Exception:
+                continue
     # For each symbol, pick a pole-anchored alert (first alert at/after the first detected pole high)
     def _find_first_pole_anchor_time(df: pd.DataFrame, start_ts: datetime, end_ts: datetime) -> Optional[datetime]:
         if df is None or df.empty:
@@ -376,7 +525,30 @@ def run_backtest(
                 pass
         # Build sorted list by time to start sessions in order
         action_alerts = sorted(selected_alerts, key=lambda a: a.get('time',''))
-    
+    # If an alerts-file is provided, load alerts directly (replay mode)
+    action_alerts_loaded = False
+    try:
+        if 'args' in globals():
+            alerts_file = getattr(args, 'alerts_file', None)
+        else:
+            alerts_file = None
+    except Exception:
+        alerts_file = None
+    if alerts_file:
+        try:
+            import json as _json
+            with open(alerts_file) as af:
+                loaded = _json.load(af)
+            # Expect list of dicts with symbol,time,price,strategy,description
+            if isinstance(loaded, list):
+                action_alerts = loaded
+                action_alerts_loaded = True
+                logging.info("Replayed alerts from file: %s (count=%d)", alerts_file, len(action_alerts))
+            else:
+                logging.warning("Alerts file does not contain a list: %s", alerts_file)
+        except Exception as e:
+            logging.warning("Failed to load alerts file %s: %s", alerts_file, e)
+
     if not action_alerts:
         logging.warning("No ACTION alerts found in time window")
         return
@@ -402,6 +574,34 @@ def run_backtest(
     
     # Process each alert using the real pattern monitoring system
     run_ts = datetime.now().strftime("%H%M%S")
+    # Persist selected alerts for reproducibility (save even if replayed, to keep a run-scoped copy)
+    try:
+        import json as _json
+        alerts_out = LOGS_DIR / f"backtest_{date}_{run_ts}_alerts.json"
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        to_dump = [{
+            'symbol': a.get('symbol'),
+            'time': a.get('time'),
+            'price': a.get('price'),
+            'strategy': a.get('strategy'),
+            'description': a.get('description'),
+        } for a in action_alerts]
+        with open(alerts_out, 'w') as af:
+            _json.dump(to_dump, af, indent=2)
+        logging.info("Saved selected alerts: %s", alerts_out)
+        # If gappers seed, also persist the watchlist used
+        try:
+            if seed_mode == 'gappers':
+                wl = LOGS_DIR / f"backtest_{date}_{run_ts}_watchlist.txt"
+                with open(wl, 'w') as wf:
+                    wf.write("# Watchlist used (seed-mode gappers)\n")
+                    for a in action_alerts:
+                        wf.write(f"{a.get('symbol')}\n")
+                logging.info("Saved watchlist: %s", wl)
+        except Exception:
+            pass
+    except Exception as e:
+        logging.warning("Failed to save selected alerts: %s", e)
     summaries_path = LOGS_DIR / f"backtest_{date}_{run_ts}_sessions.json"
     entries_csv_path = LOGS_DIR / f"backtest_{date}_{run_ts}_entries.csv"
     session_summaries: List[Dict] = []
@@ -409,6 +609,7 @@ def run_backtest(
     symbol_busy_intervals: Dict[str, List[Tuple[datetime, datetime]]] = {}
     lockout_until: Optional[datetime] = None
     recent_negatives: List[datetime] = []
+    ohlc_data_cache: Dict[str, pd.DataFrame] = {}
     for i, alert_data in enumerate(action_alerts, 1):
         # If tracker indicates daily stop hit, halt new alerts
         try:
@@ -479,6 +680,18 @@ def run_backtest(
             volume_spike=alert_data.get('rvol_5min', 0) / 100,  # Convert % to ratio
             news_catalyst=alert_data.get('description')
         )
+        # If seeded from gappers, carry prev_close if available
+        try:
+            if getattr(args, 'seed_mode', 'alerts') == 'gappers':
+                pc = alert_data.get('prev_close')
+                if pc is not None:
+                    monitor_prev_close = float(pc)
+                else:
+                    monitor_prev_close = None
+            else:
+                monitor_prev_close = None
+        except Exception:
+            monitor_prev_close = None
         
         # Start pattern monitoring using our improved system
         from tech_analysis.patterns.pattern_monitor import SessionConfig
@@ -537,14 +750,53 @@ def run_backtest(
             v2_retrace_cap_pct=float(getattr(args, 'v2_retrace_cap_pct', 0.50) or 0.50),
             v2_require_vwap_above=bool(getattr(args, 'v2_require_vwap_above', False)),
             v2_entry_confirm_ema5m=bool(getattr(args, 'v2_entry_confirm_ema5m', False)),
+            v2_first_partial_pct=float(getattr(args, 'v2_first_partial_pct', 0.5) or 0.5),
+            v2_add_back_enabled=bool(getattr(args, 'v2_add_back_enabled', False)),
+            v2_add_back_pct=float(getattr(args, 'v2_add_back_pct', 0.2) or 0.2),
+            v2_require_2r_potential=bool(getattr(args, 'v2_require_2r_potential', False)),
+            v2_no_progress_exit_minutes=int(getattr(args, 'v2_no_progress_exit_minutes', 0) or 0),
+            v2_no_progress_exit_macd_only=bool(getattr(args, 'v2_no_progress_exit_macd_only', True)),
+            v2_weakness_exit_bars=int(getattr(args, 'v2_weakness_exit_bars', 0) or 0),
+            v2_giveback_exit_frac=float(getattr(args, 'v2_giveback_exit_frac', 0.0) or 0.0),
+            # BFSv3
+            v3_max_pullback_candles=int(getattr(args, 'v3_max_pullback_candles', 3) or 3),
+            v3_min_pullback_candles=int(getattr(args, 'v3_min_pullback_candles', 2) or 2),
+            v3_max_retrace_pct=float(getattr(args, 'v3_max_retrace_pct', 0.50) or 0.50),
+            v3_no_progress_minutes=int(getattr(args, 'v3_no_progress_minutes', 0) or 0),
+            v3_use_ticks=bool(getattr(args, 'v3_use_ticks', False)),
+            v3_tick_feed=str(getattr(args, 'v3_tick_feed', 'sip')),
+            v3_require_vwap_above=bool(getattr(args, 'v3_require_vwap_above', False)),
+            v3_weakness_exit_bars=int(getattr(args, 'v3_weakness_exit_bars', 0) or 0),
+            v3_require_macd_positive=bool(getattr(args, 'v3_require_macd_positive', False)),
+            v3_require_2r_potential=bool(getattr(args, 'v3_require_2r_potential', False)),
+            v3_require_ema_trend=bool(getattr(args, 'v3_require_ema_trend', False)),
+            # Gap & Go
+            gng_min_gap_pct=float(getattr(args, 'gng_min_gap_pct', 4.0) or 4.0),
+            gng_entry_mode=str(getattr(args, 'gng_entry_mode', 'both')),
+            gng_entry_window_minutes=int(getattr(args, 'gng_entry_window_minutes', 30) or 30),
+            gng_require_news=bool(getattr(args, 'gng_require_news', False)),
+            gng_max_float_millions=float(getattr(args, 'gng_max_float_millions', 0.0) or 0.0),
         )
         monitor = PatternMonitoringSession(
             alert=action_alert,
-            patterns_to_monitor=[getattr(args, 'pattern', 'bull_flag')] if getattr(args, 'pattern', 'bull_flag') in ('bull_flag','alert_flip','bull_flag_simple','bull_flag_simple_v2') else ['bull_flag'],
+            patterns_to_monitor=[getattr(args, 'pattern', 'bull_flag')] if getattr(args, 'pattern', 'bull_flag') in ('bull_flag','alert_flip','bull_flag_simple','bull_flag_simple_v2','bull_flag_simple_v3','gap_and_go') else ['bull_flag'],
             position_sizer=position_sizer,
             config=session_cfg,
             position_tracker=position_tracker,
         )
+        # Provide float info from scanner to strategies that use it (e.g., Gap & Go)
+        try:
+            fm = alert_data.get('float')
+            if fm is not None:
+                monitor.float_millions = float(fm)
+        except Exception:
+            pass
+        # Provide prev_close to the monitor if we have it (from gappers seed)
+        try:
+            if monitor_prev_close is not None:
+                monitor.prev_close = float(monitor_prev_close)
+        except Exception:
+            pass
         
         try:
             _pat = getattr(args, 'pattern', 'bull_flag')
@@ -554,6 +806,10 @@ def run_backtest(
                 _label = 'Bull Flag Simple'
             elif _pat == 'bull_flag_simple_v2':
                 _label = 'Bull Flag Simple V2'
+            elif _pat == 'bull_flag_simple_v3':
+                _label = 'Bull Flag Simple V3'
+            elif _pat == 'gap_and_go':
+                _label = 'Gap & Go'
             else:
                 _label = 'Bull Flag'
             logging.info("🔍 Started monitoring %s for patterns (strategy: %s)", symbol, _label)
@@ -561,9 +817,24 @@ def run_backtest(
             logging.info("🔍 Started monitoring %s for patterns", symbol)
         # processed_symbols not needed since we de-dupe to one alert per symbol above
         
-        # Load OHLC data for this symbol and feed it to the pattern monitor (optionally clamp at end_time)
-        ohlc_data = load_symbol_ohlc_data(symbol, date, timeframe="1min")
+        # Load OHLC data for this symbol (from cache if available)
+        if symbol in ohlc_data_cache:
+            ohlc_data = ohlc_data_cache[symbol]
+        else:
+            ohlc_data = load_symbol_ohlc_data(symbol, date, timeframe="1min")
+            if ohlc_data is not None and not ohlc_data.empty:
+                ohlc_data_cache[symbol] = ohlc_data
         if ohlc_data is not None and not ohlc_data.empty:
+            # If using Gap & Go, optionally fetch true PMH from Alpaca ticks
+            try:
+                if getattr(args, 'pattern', 'bull_flag') == 'gap_and_go':
+                    from tools.alpaca_ticks import fetch_premarket_high
+                    pmh = fetch_premarket_high(symbol, date, feed='sip')
+                    if pmh is not None:
+                        monitor.external_premarket_high = float(pmh)
+                        logging.info("PMH (ticks) for %s: %.4f", symbol, float(pmh))
+            except Exception as e:
+                logging.info("PMH (ticks) unavailable for %s: %s", symbol, e)
             # Compute pole anchor time (first bar before a 2-red streak) and set known flagpole high/time
             try:
                 start_dt = datetime.strptime(f"{date} {start_time}", "%Y-%m-%d %H:%M")
@@ -822,10 +1093,19 @@ if __name__ == "__main__":
     parser.add_argument('--disable-early-pullback-trim', action='store_true', help='Disable early pullback trim on first meaningful 1-min red')
     parser.add_argument('--entry-cutoff-minutes', type=int, default=15, help='Minutes after alert to allow new entries (per-alert freshness window)')
     parser.add_argument('--require-green-breakout', action='store_true', help='Require breakout candle to close green before entry (conservative)')
-    parser.add_argument('--breakout-vol-mult', type=float, default=0.0, help='Require breakout volume ≥ pullback avg * mult (0 disables)')
+    parser.add_argument('--breakout-vol-mult', type=float, default=1.0, help='Require breakout volume ≥ pullback avg * mult (0 disables)')
     parser.add_argument('--min-pullback-avg-volume', type=float, default=0.0, help='Require pullback average 1-min volume ≥ threshold (0 disables)')
     parser.add_argument('--max-daily-loss', type=float, help='Dollar max loss to halt new entries (kill switch)')
-    parser.add_argument('--pattern', choices=['bull_flag','alert_flip','bull_flag_simple','bull_flag_simple_v2'], default='bull_flag', help='Choose pattern/strategy to run')
+    parser.add_argument('--pattern', choices=['bull_flag','alert_flip','bull_flag_simple','bull_flag_simple_v2','bull_flag_simple_v3','gap_and_go'], default='bull_flag', help='Choose pattern/strategy to run')
+    parser.add_argument('--seed-mode', choices=['alerts','gappers'], default='alerts', help='Seed sessions from ACTION alerts (default) or Top Gappers at 9:30')
+    parser.add_argument('--gappers-top-n', type=int, default=5, help='Seed-mode gappers: take top-N ranked by gap% (or available score)')
+    parser.add_argument('--gappers-min-premarket-volume', type=int, default=0, help='Seed-mode gappers: require premarket volume >= this (0 disables)')
+    # Gap & Go (entry-only) options
+    parser.add_argument('--gng-min-gap-pct', type=float, default=4.0, help='Gap & Go: minimum gap percent vs prior close')
+    parser.add_argument('--gng-entry-mode', choices=['premarket_high','opening_range','premarket_flag','both'], default='both', help='Gap & Go: entry mode')
+    parser.add_argument('--gng-entry-window-minutes', type=int, default=30, help='Gap & Go: entry window minutes from 9:30')
+    parser.add_argument('--gng-require-news', action='store_true', help='Gap & Go: require news catalyst')
+    parser.add_argument('--gng-max-float-millions', type=float, default=20.0, help='Gap & Go: require float <= this value (0 disables)')
     parser.add_argument('--per-alert-sessions', action='store_true', help='Start a new monitoring session for every ACTION alert (no de-dup)')
     parser.add_argument('--spread-cap-bps', type=float, default=0.0, help='Reject entries if (high-low)/close exceeds this bps cap (0 disables)')
     parser.add_argument('--require-macd-positive', action='store_true', help='Require MACD > 0 and histogram > 0 at entry bar')
@@ -859,10 +1139,30 @@ if __name__ == "__main__":
     parser.add_argument('--v2-retrace-cap-pct', type=float, default=0.50, help='BFSv2: pullback retrace cap as fraction of pole height (0-1)')
     parser.add_argument('--v2-require-vwap-above', action='store_true', help='BFSv2: require price >= VWAP at entry')
     parser.add_argument('--v2-entry-confirm-ema5m', action='store_true', help='BFSv2: require EMA9>EMA20 on 5-min timeframe at entry')
+    # Discipline/exit enhancements
+    parser.add_argument('--v2-require-2r-potential', action='store_true', help='BFSv2: require target potential >= 2R at entry (skip otherwise)')
+    parser.add_argument('--v2-no-progress-exit-minutes', type=int, default=0, help='BFSv2: exit at T+N minutes if price never > entry and (optionally) MACD bearish (0 disables)')
+    parser.add_argument('--v2-no-progress-exit-macd-only', action='store_true', help='BFSv2: require MACD bearish to trigger no-progress exit')
+    parser.add_argument('--v2-weakness-exit-bars', type=int, default=0, help='BFSv2: in first M bars after entry, exit if close < VWAP or EMA9 (0 disables)')
+    parser.add_argument('--v2-giveback-exit-frac', type=float, default=0.0, help='BFSv2: exit remainder if giveback exceeds this fraction of max-open R after partial (0 disables)')
+    # BFSv3 (tick-level entry options)
+    parser.add_argument('--v3-max-pullback-candles', type=int, default=5, help='BFSv3: max consecutive red candles in pullback')
+    parser.add_argument('--v3-min-pullback-candles', type=int, default=1, help='BFSv3: min consecutive red candles before entry allowed')
+    parser.add_argument('--v3-max-retrace-pct', type=float, default=0.50, help='BFSv3: max retrace as fraction of pole (0-1)')
+    parser.add_argument('--v3-no-progress-minutes', type=int, default=0, help='BFSv3: bail if no progress after N minutes (0 disables)')
+    parser.add_argument('--v3-use-ticks', action='store_true', help='BFSv3: refine entry with Alpaca trades (env keys required)')
+    parser.add_argument('--v3-tick-feed', choices=['sip','iex'], default='sip', help='BFSv3: Alpaca trades feed to use')
+    parser.add_argument('--v3-require-vwap-above', action='store_true', help='BFSv3: require close ≥ VWAP at trigger bar')
+    parser.add_argument('--v3-weakness-exit-bars', type=int, default=0, help='BFSv3: in first M bars, exit if close < VWAP or EMA9 (0 disables)')
+    parser.add_argument('--v3-require-macd-positive', action='store_true', help='BFSv3: require MACD>0 and histogram>0 at trigger bar')
+    parser.add_argument('--v3-require-2r-potential', action='store_true', help='BFSv3: require target distance ≥ 2R at entry')
+    parser.add_argument('--v3-require-ema-trend', action='store_true', help='BFSv3: require EMA9 > EMA20 at trigger bar')
     parser.add_argument('--symbols', help='Comma-separated symbols to include (e.g., BSLK,DOGZ)')
     parser.add_argument('--exclude-symbols', help='Comma-separated symbols to exclude')
     parser.add_argument('--symbols-file', help='Path to file with one or comma-separated symbols per line')
     parser.add_argument('--exclude-symbols-file', help='Path to file with one or comma-separated symbols per line to exclude')
+    # Repro/replay: allow running with a saved alerts file (bypass selection)
+    parser.add_argument('--alerts-file', help='Path to saved alerts JSON (from *_alerts.json) to replay alerts exactly')
     
     args = parser.parse_args()
 
@@ -872,6 +1172,16 @@ if __name__ == "__main__":
     log_path = args.log_file if args.log_file else default_log
 
     setup_logging(log_path, args.log_level)
+    # Persist CLI flags for reproducibility
+    try:
+        import json as _json
+        cfg_out = LOGS_DIR / f"backtest_{args.date}_{now_ts}_config.json"
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cfg_out, 'w') as cf:
+            _json.dump(vars(args), cf, indent=2)
+        logging.info("Saved run config: %s", cfg_out)
+    except Exception as e:
+        logging.warning("Failed to save run config: %s", e)
     logging.info(
         "Config: trigger=%s | grace_bars=%d | use_5min_first_red_exit=%s | ema_vwap_exit=%s | macd_exit=%s | entry_conf=%s | stop_slip=%.3f | entry_slip=%.3f | add_back=%s/%d | ext_exit=%s | early_trim=%s | max_daily_loss=%s | brk_vol_mult=%.2f | min_pb_avg_vol=%.0f",
         args.trigger_mode,
@@ -890,25 +1200,41 @@ if __name__ == "__main__":
         float(args.breakout_vol_mult or 0.0),
         float(args.min_pullback_avg_volume or 0.0),
     )
-    logging.info(
-        "BFSv2: runner=%s | macd_gate=%d | hard_cap_R=%.1f | partial_on_alert_high=%s | enter_on_close_gate=%s | min_stop=$%.2f",
-        "on" if args.v2_runner_enabled else "off",
-        int(args.v2_runner_macd_gate_minutes or 10),
-        float(args.v2_runner_hard_cap_r or 3.0),
-        "on" if args.v2_partial_on_alert_high else "off",
-        "on" if args.v2_enter_on_close_with_gate else "off",
-        float(args.v2_min_stop_dollars or 0.10),
-    )
-    logging.info(
-        "BFSv2 extras: macd_gate_require_runner=%s | require_no_progress=%s | no_progress_R=%.2f | max_wait_bars=%d | retrace_cap=%.2f | vwap_guard=%s | ema5m=%s",
-        bool(getattr(args, 'v2_macd_gate_require_runner', True)),
-        bool(getattr(args, 'v2_macd_gate_require_no_progress', False)),
-        float(getattr(args, 'v2_no_progress_thresh_r', 0.0) or 0.0),
-        int(getattr(args, 'v2_max_wait_bars', 6) or 6),
-        float(getattr(args, 'v2_retrace_cap_pct', 0.50) or 0.50),
-        bool(getattr(args, 'v2_require_vwap_above', False)),
-        bool(getattr(args, 'v2_entry_confirm_ema5m', False)),
-    )
+    if getattr(args, 'pattern', 'bull_flag') == 'bull_flag_simple_v3':
+        logging.info(
+            "BFSv3: min_reds=%d | max_reds=%d | retrace_cap=%.2f | no_progress=%dm | vwap=%s | macd_pos=%s | ema_trend=%s | weak_exit_bars=%d | vol_mult=%.2f | spread_cap_bps=%.0f | min_stop=$%.2f",
+            int(getattr(args, 'v3_min_pullback_candles', 1) or 1),
+            int(getattr(args, 'v3_max_pullback_candles', 5) or 5),
+            float(getattr(args, 'v3_max_retrace_pct', 0.5) or 0.5),
+            int(getattr(args, 'v3_no_progress_minutes', 0) or 0),
+            bool(getattr(args, 'v3_require_vwap_above', False)),
+            bool(getattr(args, 'v3_require_macd_positive', False)),
+            bool(getattr(args, 'v3_require_ema_trend', False)),
+            int(getattr(args, 'v3_weakness_exit_bars', 0) or 0),
+            float(getattr(args, 'breakout_vol_mult', 0.0) or 0.0),
+            float(getattr(args, 'spread_cap_bps', 0.0) or 0.0),
+            float(getattr(args, 'v2_min_stop_dollars', 0.0) or 0.0),
+        )
+    else:
+        logging.info(
+            "BFSv2: runner=%s | macd_gate=%d | hard_cap_R=%.1f | partial_on_alert_high=%s | enter_on_close_gate=%s | min_stop=$%.2f",
+            "on" if args.v2_runner_enabled else "off",
+            int(args.v2_runner_macd_gate_minutes or 10),
+            float(args.v2_runner_hard_cap_r or 3.0),
+            "on" if args.v2_partial_on_alert_high else "off",
+            "on" if args.v2_enter_on_close_with_gate else "off",
+            float(args.v2_min_stop_dollars or 0.10),
+        )
+        logging.info(
+            "BFSv2 extras: macd_gate_require_runner=%s | require_no_progress=%s | no_progress_R=%.2f | max_wait_bars=%d | retrace_cap=%.2f | vwap_guard=%s | ema5m=%s",
+            bool(getattr(args, 'v2_macd_gate_require_runner', True)),
+            bool(getattr(args, 'v2_macd_gate_require_no_progress', False)),
+            float(getattr(args, 'v2_no_progress_thresh_r', 0.0) or 0.0),
+            int(getattr(args, 'v2_max_wait_bars', 6) or 6),
+            float(getattr(args, 'v2_retrace_cap_pct', 0.50) or 0.50),
+            bool(getattr(args, 'v2_require_vwap_above', False)),
+            bool(getattr(args, 'v2_entry_confirm_ema5m', False)),
+        )
     def _load_symfile(p):
         if not p:
             return []

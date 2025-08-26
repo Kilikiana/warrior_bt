@@ -34,6 +34,8 @@ try:
     from .bull_flag_strategy import BullFlagStrategy
     from .bull_flag_simple import BullFlagSimpleStrategy
     from .bull_flag_simple_v2 import BullFlagSimpleV2Strategy
+    from .bull_flag_simple_v3 import BullFlagSimpleV3Strategy
+    from .gap_and_go import GapAndGoStrategy
     from ..ema_calculator import EMACalculator, RossCameronEMAConfig
     from ..macd_calculator import MACDCalculator, RossCameronMACDConfig
     from ...position_management.position_sizer import PositionSizer  # type: ignore
@@ -47,6 +49,8 @@ except ImportError:
     from bull_flag_strategy import BullFlagStrategy
     from bull_flag_simple import BullFlagSimpleStrategy
     from bull_flag_simple_v2 import BullFlagSimpleV2Strategy
+    from bull_flag_simple_v3 import BullFlagSimpleV3Strategy
+    from gap_and_go import GapAndGoStrategy
     sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
     from ema_calculator import EMACalculator, RossCameronEMAConfig
     from macd_calculator import MACDCalculator, RossCameronMACDConfig
@@ -191,6 +195,8 @@ class SessionConfig:
     v2_min_stop_dollars: float = 0.10      # minimum stop distance used for sizing/targets
     # Entry confirmations (single selector for BFSv2): 'both' | 'macd_only' | 'ema_only' | 'none'
     v2_entry_confirmations: str = "none"
+    # BFSv2 first partial percentage at first target (default 0.5 for 50%)
+    v2_first_partial_pct: float = 0.5
     # BFSv2 MACD gate controls
     v2_macd_gate_require_runner: bool = True
     v2_macd_gate_require_no_progress: bool = False
@@ -201,6 +207,33 @@ class SessionConfig:
     # Optional entry guards
     v2_require_vwap_above: bool = False
     v2_entry_confirm_ema5m: bool = False
+    # BFSv2 add-back controls
+    v2_add_back_enabled: bool = False
+    v2_add_back_pct: float = 0.2  # fraction of initial shares to add back once
+    # BFSv2 discipline/exit enhancements
+    v2_require_2r_potential: bool = False
+    v2_no_progress_exit_minutes: int = 0   # 0 disables
+    v2_no_progress_exit_macd_only: bool = True
+    v2_weakness_exit_bars: int = 0         # bars after entry to enforce close<VWAP/EMA9 exit (0 disables)
+    v2_giveback_exit_frac: float = 0.0     # fraction of max-open R to allow before exiting remainder (0 disables)
+    # --- BFSv3: minimal bull flag with optional tick-level entry ---
+    v3_max_pullback_candles: int = 5
+    v3_min_pullback_candles: int = 1
+    v3_max_retrace_pct: float = 0.50
+    v3_no_progress_minutes: int = 0
+    v3_use_ticks: bool = False
+    v3_tick_feed: str = "sip"  # 'sip' or 'iex'
+    v3_require_vwap_above: bool = False
+    v3_weakness_exit_bars: int = 0
+    v3_require_macd_positive: bool = False
+    v3_require_2r_potential: bool = False
+    v3_require_ema_trend: bool = False  # EMA9 > EMA20 at trigger
+    # --- Gap & Go (entry-only) ---
+    gng_min_gap_pct: float = 4.0           # require gap ≥ this percent at open
+    gng_entry_mode: str = "both"           # 'premarket_high' | 'opening_range' | 'both'
+    gng_entry_window_minutes: int = 30     # allow entries from 9:30 to 10:00
+    gng_require_news: bool = False         # require a catalyst string
+    gng_max_float_millions: float = 0.0    # require float <= this (0 disables)
 
 class PatternMonitoringSession:
     """
@@ -258,6 +291,10 @@ class PatternMonitoringSession:
         self._bull_flag_simple: Optional[BullFlagSimpleStrategy] = None
         # Simple v2 (duplicate of alert_flip)
         self._bull_flag_simple_v2: Optional[BullFlagSimpleV2Strategy] = None
+        # Simple v3 (minimal with optional tick entry)
+        self._bull_flag_simple_v3: Optional[BullFlagSimpleV3Strategy] = None
+        # Gap & Go (entry-only; relies on default management)
+        self._gap_and_go: Optional[GapAndGoStrategy] = None
         # Set of alert bar timestamps (as pandas Timestamps) to avoid exiting on alert bars
         try:
             ats = getattr(config, 'all_alert_times', None) if config else None
@@ -278,6 +315,10 @@ class PatternMonitoringSession:
                 self._bull_flag_simple = BullFlagSimpleStrategy(all_alert_times=self._all_alert_times)
             if 'bull_flag_simple_v2' in self.patterns_to_monitor:
                 self._bull_flag_simple_v2 = BullFlagSimpleV2Strategy(all_alert_times=self._all_alert_times)
+            if 'bull_flag_simple_v3' in self.patterns_to_monitor:
+                self._bull_flag_simple_v3 = BullFlagSimpleV3Strategy()
+            if 'gap_and_go' in self.patterns_to_monitor:
+                self._gap_and_go = GapAndGoStrategy()
         # Guard to avoid repeated actions within the same 5-min bucket
         self._last_5min_action_bucket = None
         
@@ -327,6 +368,13 @@ class PatternMonitoringSession:
         self.v2_entry_confirmations = getattr(cfg, 'v2_entry_confirmations', 'none')
         if self.v2_entry_confirmations not in ("both","macd_only","ema_only","none"):
             self.v2_entry_confirmations = "none"
+        # First partial percentage for BFSv2
+        try:
+            self.v2_first_partial_pct = float(getattr(cfg, 'v2_first_partial_pct', 0.5) or 0.5)
+            if not (0.05 <= self.v2_first_partial_pct <= 0.95):
+                self.v2_first_partial_pct = 0.5
+        except Exception:
+            self.v2_first_partial_pct = 0.5
         # MACD gate + structure knobs
         self.v2_macd_gate_require_runner = bool(getattr(cfg, 'v2_macd_gate_require_runner', True))
         self.v2_macd_gate_require_no_progress = bool(getattr(cfg, 'v2_macd_gate_require_no_progress', False))
@@ -344,6 +392,29 @@ class PatternMonitoringSession:
             self.v2_retrace_cap_pct = 0.50
         self.v2_require_vwap_above = bool(getattr(cfg, 'v2_require_vwap_above', False))
         self.v2_entry_confirm_ema5m = bool(getattr(cfg, 'v2_entry_confirm_ema5m', False))
+        # Add-back controls
+        self.v2_add_back_enabled = bool(getattr(cfg, 'v2_add_back_enabled', False))
+        try:
+            self.v2_add_back_pct = float(getattr(cfg, 'v2_add_back_pct', 0.2) or 0.2)
+            if not (0.05 <= self.v2_add_back_pct <= 0.5):
+                self.v2_add_back_pct = 0.2
+        except Exception:
+            self.v2_add_back_pct = 0.2
+        # Discipline/exit enhancements
+        self.v2_require_2r_potential = bool(getattr(cfg, 'v2_require_2r_potential', False))
+        try:
+            self.v2_no_progress_exit_minutes = int(getattr(cfg, 'v2_no_progress_exit_minutes', 0) or 0)
+        except Exception:
+            self.v2_no_progress_exit_minutes = 0
+        self.v2_no_progress_exit_macd_only = bool(getattr(cfg, 'v2_no_progress_exit_macd_only', True))
+        try:
+            self.v2_weakness_exit_bars = int(getattr(cfg, 'v2_weakness_exit_bars', 0) or 0)
+        except Exception:
+            self.v2_weakness_exit_bars = 0
+        try:
+            self.v2_giveback_exit_frac = float(getattr(cfg, 'v2_giveback_exit_frac', 0.0) or 0.0)
+        except Exception:
+            self.v2_giveback_exit_frac = 0.0
         self.position_sizer = position_sizer
         self.sizing_method = cfg.sizing_method
         self.use_5min_first_red_exit = cfg.use_5min_first_red_exit
@@ -416,7 +487,12 @@ class PatternMonitoringSession:
         # to run both entry and exit logic on every bar without interfering with
         # the default bull-flag management. When a strategy is active, we bypass
         # the default _manage_position to avoid double exits.
-        strategy_active = (self._alert_flip is not None) or (getattr(self, '_bull_flag_simple', None) is not None) or (getattr(self, '_bull_flag_simple_v2', None) is not None)
+        strategy_active = (
+            (self._alert_flip is not None)
+            or (getattr(self, '_bull_flag_simple', None) is not None)
+            or (getattr(self, '_bull_flag_simple_v2', None) is not None)
+            or (getattr(self, '_bull_flag_simple_v3', None) is not None)
+        )
 
         # Check patterns if monitoring is active and entries are allowed (before cutoff)
         # Entries allowed only:
@@ -450,6 +526,10 @@ class PatternMonitoringSession:
                 if getattr(self, '_bull_flag_simple_v2', None) is not None:
                     if (self.position is None and entries_allowed) or (self.position is not None):
                         self._bull_flag_simple_v2.on_bar(self, df, timestamp)
+                # Entry/exit for bull_flag_simple_v3
+                if getattr(self, '_bull_flag_simple_v3', None) is not None:
+                    if (self.position is None and entries_allowed) or (self.position is not None):
+                        self._bull_flag_simple_v3.on_bar(self, df, timestamp)
             except Exception:
                 pass
             # Do not invoke default _manage_position when a simple strategy is active
@@ -496,6 +576,11 @@ class PatternMonitoringSession:
 
         if getattr(self, '_bull_flag_simple_v2', None) is not None:
             if self._bull_flag_simple_v2.on_bar(self, df, timestamp):
+                return
+
+        # Gap & Go entries (entry-only; allow default management to run)
+        if getattr(self, '_gap_and_go', None) is not None:
+            if self._gap_and_go.on_bar(self, df, timestamp):
                 return
 
         # MACD-only trigger mode (opt-in)
@@ -1557,6 +1642,14 @@ class PatternMonitoringSession:
     
     def _exit_position(self, timestamp: datetime, price: float, reason: ExitReason, shares: int) -> None:
         """Exit entire position"""
+        # If we already have no shares, avoid duplicate exits/log spam
+        try:
+            if self.position is None or int(shares) <= 0 or (hasattr(self.position, 'current_shares') and int(self.position.current_shares) <= 0):
+                logging.debug("Skip duplicate exit for %s: no shares to close (reason=%s)", self.symbol, reason.value)
+                self.status = MonitoringStatus.MONITORING_STOPPED
+                return
+        except Exception:
+            pass
         execution = TradeExecution(
             timestamp=timestamp,
             symbol=self.symbol,
@@ -1570,7 +1663,10 @@ class PatternMonitoringSession:
         # Close in external tracker first to compute realized P&L
         try:
             if self._tracker is not None:
-                if hasattr(self._tracker, 'close_position'):
+                # Only close in tracker if it still has an active position for this symbol
+                if hasattr(self._tracker, 'active_positions') and self.symbol not in getattr(self._tracker, 'active_positions', {}):
+                    pass
+                elif hasattr(self._tracker, 'close_position'):
                     self._tracker.close_position(self.symbol, float(price), timestamp)
         except Exception as e:
             logging.debug("Tracker integration failed on close for %s: %s", self.symbol, e)
@@ -1606,7 +1702,12 @@ class PatternMonitoringSession:
         else:
             logging.info(f"EXITED {self.symbol}: {shares} shares at ${price:.2f} - {reason.value}")
         
+        # Mark session stopped and clear in-session position to prevent re-entry/duplicate exits
         self.status = MonitoringStatus.MONITORING_STOPPED
+        try:
+            self.position = None
+        except Exception:
+            pass
 
     # Public method to force-flatten at session end
     def force_flatten(self, timestamp: datetime, price: float) -> None:
